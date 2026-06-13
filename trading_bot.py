@@ -10,7 +10,6 @@ from datetime import date, datetime
 
 import robin_stocks.robinhood as r
 import yfinance as yf
-from slack_sdk import WebClient
 import requests
 import anthropic
 
