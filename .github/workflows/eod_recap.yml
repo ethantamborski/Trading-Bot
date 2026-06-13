@@ -1,0 +1,32 @@
+name: EOD Recap
+
+on:
+  schedule:
+    # 4pm EDT (UTC-4) every weekday
+    - cron: '0 20 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  recap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run EOD recap
+        env:
+          ROBINHOOD_EMAIL:     ${{ secrets.ROBINHOOD_EMAIL }}
+          ROBINHOOD_PASSWORD:  ${{ secrets.ROBINHOOD_PASSWORD }}
+          ROBINHOOD_SESSION:   ${{ secrets.ROBINHOOD_SESSION }}
+          SLACK_WEBHOOK_URL:   ${{ secrets.SLACK_WEBHOOK_URL }}
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python trading_bot.py eod

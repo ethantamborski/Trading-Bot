@@ -1,0 +1,41 @@
+name: Morning Trading Brief
+
+on:
+  schedule:
+    # 9am EDT (UTC-4) every weekday — adjust to '0 14 * * 1-5' in winter (EST)
+    - cron: '0 13 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'morning or eod'
+        required: false
+        default: 'morning'
+        type: choice
+        options:
+          - morning
+          - eod
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run trading bot
+        env:
+          ROBINHOOD_EMAIL:     ${{ secrets.ROBINHOOD_EMAIL }}
+          ROBINHOOD_PASSWORD:  ${{ secrets.ROBINHOOD_PASSWORD }}
+          ROBINHOOD_SESSION:   ${{ secrets.ROBINHOOD_SESSION }}
+          SLACK_WEBHOOK_URL:   ${{ secrets.SLACK_WEBHOOK_URL }}
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python trading_bot.py ${{ github.event.inputs.mode || 'morning' }}
