@@ -13,6 +13,8 @@ import robin_stocks.robinhood as r
 import yfinance as yf
 import requests
 import anthropic
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ── Config ────────────────────────────────────────────────────────────────
 ROBINHOOD_EMAIL    = os.environ['ROBINHOOD_EMAIL']
@@ -20,6 +22,9 @@ ROBINHOOD_PASSWORD = os.environ['ROBINHOOD_PASSWORD']
 ROBINHOOD_SESSION  = os.environ['ROBINHOOD_SESSION']
 SLACK_WEBHOOK_URL  = os.environ['SLACK_WEBHOOK_URL']
 ANTHROPIC_API_KEY  = os.environ['ANTHROPIC_API_KEY']
+GOOGLE_SHEET_ID    = os.environ.get('GOOGLE_SHEET_ID', '')
+GCLOUD_KEY_PATH    = '/opt/trading-bot/gcloud.json'
+SHEET_URL          = f'https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}'
 
 ACCOUNT_NUMBER = '456166776'
 SLACK_MENTION  = '<@U0B8ZNEB9N2>'
@@ -506,6 +511,128 @@ def load_positions(buying_power):
 
 # ── Slack ─────────────────────────────────────────────────────────────────
 
+def get_sheet():
+    if not GOOGLE_SHEET_ID or not os.path.exists(GCLOUD_KEY_PATH):
+        return None
+    try:
+        creds = Credentials.from_service_account_file(
+            GCLOUD_KEY_PATH,
+            scopes=['https://spreadsheets.google.com/feeds',
+                    'https://www.googleapis.com/auth/drive']
+        )
+        return gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID)
+    except Exception as e:
+        print(f"Sheets connection error: {e}")
+        return None
+
+
+def ensure_tab(sh, title, headers):
+    try:
+        ws = sh.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=2000, cols=len(headers)+2)
+        ws.append_row(headers, value_input_option='USER_ENTERED')
+    return ws
+
+
+def update_sheets(mode, today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
+                  held, trades_done, buying_power, equity, stops_hit, targets_hit):
+    sh = get_sheet()
+    if not sh:
+        print("Sheets not configured, skipping.")
+        return
+    try:
+        # ── Dashboard (full refresh every run) ────────────────────────────
+        try:
+            dash = sh.worksheet('Dashboard')
+            dash.clear()
+        except gspread.exceptions.WorksheetNotFound:
+            dash = sh.add_worksheet(title='Dashboard', rows=100, cols=10)
+
+        rows = [
+            ['TRADING BOT DASHBOARD', '', f'Last updated: {today}  |  Mode: {mode.upper()}'],
+            [''],
+            ['── MARKET ─────────────────────────────'],
+            ['SPY', f'{spy_chg:+.2f}%'],
+            ['QQQ', f'{qqq_chg:+.2f}%'],
+            ['VIX', f'{vix:.1f}'],
+            ['Fear & Greed', fg_label(fg_score)],
+            [''],
+            ['── SECTORS ────────────────────────────', 'Change', 'vs SPY'],
+        ]
+        for sec, d in sorted(sector_perf.items(), key=lambda x: x[1]['rs'], reverse=True):
+            rows.append([sec, f"{d['chg']:+.2f}%", f"{d['rs']:+.2f}%"])
+        rows.append([''])
+        rows.append(['── OPEN POSITIONS ─────────────────────', 'Entry', 'Current', 'P&L %', 'P&L $', 'Stop', 'To Stop', 'Target', 'To Target'])
+        for sym, h in held.items():
+            dpnl   = (h['price'] - h['cost']) * h['qty']
+            tostop = (h['price'] - h['stop']) / h['price'] * 100
+            totgt  = (h['cost'] * 1.20 - h['price']) / h['price'] * 100
+            rows.append([sym, f"${h['cost']:.2f}", f"${h['price']:.2f}",
+                         f"{h['pnl']:+.1f}%", f"${dpnl:+.2f}",
+                         f"${h['stop']:.2f}", f"{tostop:.1f}%",
+                         f"${h['cost']*1.20:.2f}", f"{totgt:.1f}%"])
+        if not held:
+            rows.append(['No open positions'])
+        rows += [[''], ['── PORTFOLIO ──────────────────────────'],
+                 ['Cash', f'${buying_power:.2f}'],
+                 ['Total Equity', f'${equity:.2f}'],
+                 ['# Positions', str(len(held))]]
+        dash.update(rows, 'A1')
+        print("Dashboard updated.")
+    except Exception as e:
+        print(f"Dashboard error: {e}")
+
+    try:
+        # ── Daily Log (one row per run) ───────────────────────────────────
+        hdrs = ['Date','Mode','SPY%','QQQ%','VIX','Fear&Greed','# Positions',
+                '# Trades','Stops Hit','Targets Hit','Cash','Total Equity']
+        ws = ensure_tab(sh, 'Daily Log', hdrs)
+        ws.append_row([today, mode, f'{spy_chg:+.2f}%', f'{qqq_chg:+.2f}%',
+                       f'{vix:.1f}', fg_label(fg_score), len(held), len(trades_done),
+                       len(stops_hit), len(targets_hit),
+                       f'${buying_power:.2f}', f'${equity:.2f}'],
+                      value_input_option='USER_ENTERED')
+        print("Daily log appended.")
+    except Exception as e:
+        print(f"Daily log error: {e}")
+
+    try:
+        # ── Trade Log (one row per trade) ─────────────────────────────────
+        if trades_done:
+            hdrs = ['Date','Symbol','Action','Price','Amount','Conviction',
+                    'Fundamental','Macro','Technical','Innovation','EV',
+                    'Stop','Target','Final Thesis','Primary Risk']
+            ws = ensure_tab(sh, 'Trade Log', hdrs)
+            for t in trades_done:
+                c = t['committee']
+                ws.append_row([
+                    today, t['symbol'], 'BUY', f"${t['price']:.2f}", f"${t['amount']:.2f}",
+                    f"{c['conviction']}/10",
+                    f"{c['fundamental']['verdict']} ({c['fundamental']['score']}/10)",
+                    f"{c['macro']['verdict']} ({c['macro']['score']}/10)",
+                    f"{c['technical']['verdict']} ({c['technical']['score']}/10)",
+                    f"{c['innovation']['verdict']} ({c['innovation']['score']}/10)",
+                    c['risk_manager']['ev'],
+                    f"${t['stop']:.2f}", f"${t['target']:.2f}",
+                    c.get('final_thesis',''), c.get('primary_risk','')
+                ], value_input_option='USER_ENTERED')
+            print(f"Trade log: {len(trades_done)} trades logged.")
+    except Exception as e:
+        print(f"Trade log error: {e}")
+
+    try:
+        # ── Performance (daily equity tracking) ───────────────────────────
+        hdrs = ['Date','Total Equity','Cash','# Positions','Trades Today']
+        ws = ensure_tab(sh, 'Performance', hdrs)
+        ws.append_row([today, f'${equity:.2f}', f'${buying_power:.2f}',
+                       str(len(held)), str(len(trades_done))],
+                      value_input_option='USER_ENTERED')
+        print("Performance log appended.")
+    except Exception as e:
+        print(f"Performance log error: {e}")
+
+
 def slack_send(msg):
     try:
         r_ = requests.post(SLACK_WEBHOOK_URL, json={'text': msg}, timeout=15)
@@ -636,8 +763,17 @@ def main():
             lines.append('\n*Stops executed:*')
             for s in stops_hit:
                 lines.append(f"  ⚠️ {s['symbol']} @ ${s['price']:.2f} | P&L: {s['pnl']:+.1f}% ({s['type']})")
-        lines.append(f"\n*Cash:* ${buying_power:.2f} | *Total equity:* ${equity:.2f}")
-        slack_send('\n'.join(lines))
+        update_sheets('eod', today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
+                      held, [], buying_power, equity, stops_hit, targets_hit)
+        eod_lines = [f"{SLACK_MENTION} 📊 *EOD Recap ready — {today}* | <{SHEET_URL}|Open Dashboard>"]
+        if targets_hit:
+            for t in targets_hit:
+                eod_lines.append(f"  🎯 *TAKE PROFIT:* {t['symbol']} @ ${t['price']:.2f} | {t['pnl']:+.1f}%")
+        if stops_hit:
+            for s in stops_hit:
+                eod_lines.append(f"  ⚠️ *STOP HIT:* {s['symbol']} @ ${s['price']:.2f} | {s['pnl']:+.1f}%")
+        eod_lines.append(f"  Cash: ${buying_power:.2f} | Equity: ${equity:.2f}")
+        slack_send('\n'.join(eod_lines))
         r.logout()
         return
 
@@ -789,7 +925,25 @@ def main():
     lines.append(f"\n*Cash:* ${buying_power:.2f} | *Total equity:* ${equity:.2f}")
     lines.append('_Override: sell directly in Robinhood app_')
 
-    slack_send('\n'.join(lines))
+    # Write everything to Google Sheets
+    update_sheets(mode, today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
+                  held, trades_done, buying_power, equity, stops_hit, targets_hit)
+
+    # Slack — minimal ping with link + any critical alerts
+    ping_lines = [f"{SLACK_MENTION} 📊 *Morning Brief ready — {today}* | <{SHEET_URL}|Open Dashboard>"]
+    if targets_hit:
+        for t in targets_hit:
+            ping_lines.append(f"  🎯 *TAKE PROFIT:* {t['symbol']} @ ${t['price']:.2f} | P&L: *{t['pnl']:+.1f}%*")
+    if stops_hit:
+        for s in stops_hit:
+            ping_lines.append(f"  ⚠️ *STOP HIT:* {s['symbol']} @ ${s['price']:.2f} | P&L: {s['pnl']:+.1f}%")
+    if trades_done:
+        syms = ', '.join([f"{t['symbol']} ({t['committee']['conviction']}/10)" for t in trades_done])
+        ping_lines.append(f"  💰 *Bought:* {syms}")
+    else:
+        ping_lines.append(f"  No new trades today.")
+    ping_lines.append(f"  Cash: ${buying_power:.2f} | Equity: ${equity:.2f}")
+    slack_send('\n'.join(ping_lines))
     r.logout()
     print("Done.")
 
