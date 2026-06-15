@@ -592,7 +592,7 @@ def update_sheets(mode, today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
                        f'{vix:.1f}', fg_label(fg_score), len(held), len(trades_done),
                        len(stops_hit), len(targets_hit),
                        f'${buying_power:.2f}', f'${equity:.2f}'],
-                      value_input_option='USER_ENTERED')
+                      value_input_option='RAW')
         print("Daily log appended.")
     except Exception as e:
         print(f"Daily log error: {e}")
