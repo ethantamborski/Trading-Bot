@@ -509,6 +509,298 @@ def load_positions(buying_power):
     return held, stops_hit, targets_hit, trailing_log, buying_power
 
 
+# ── Sheets formatting helpers ─────────────────────────────────────────────
+
+_C = {
+    'navy':   '#1B2B4B', 'blue':   '#2E5FA3', 'lblue':  '#EBF0FA',
+    'green':  '#0F7B3F', 'lgreen': '#D5F5E3', 'red':    '#C0392B',
+    'lred':   '#FADBD8', 'gold':   '#D4AC0D', 'white':  '#FFFFFF',
+    'gray':   '#F7F9FC', 'bgray':  '#E8EDF5', 'dgray':  '#2C3E50',
+    'border': '#D5D8DC',
+}
+
+
+def _rgb(h):
+    h = h.lstrip('#')
+    return {'red': int(h[0:2],16)/255, 'green': int(h[2:4],16)/255, 'blue': int(h[4:6],16)/255}
+
+
+def _rng(sid, r1, r2, c1, c2):
+    return {'sheetId': sid, 'startRowIndex': r1, 'endRowIndex': r2,
+            'startColumnIndex': c1, 'endColumnIndex': c2}
+
+
+def _cell(sid, r1, r2, c1, c2, **kw):
+    fmt, fields = {}, []
+    if 'bg' in kw:
+        fmt['backgroundColor'] = _rgb(kw['bg']); fields.append('backgroundColor')
+    tf = {}
+    if 'fg' in kw:   tf['foregroundColor'] = _rgb(kw['fg'])
+    if kw.get('bold'):  tf['bold'] = True
+    if kw.get('italic'): tf['italic'] = True
+    if 'size' in kw: tf['fontSize'] = kw['size']
+    if tf: fmt['textFormat'] = tf; fields.append('textFormat')
+    if 'align' in kw:  fmt['horizontalAlignment'] = kw['align']; fields.append('horizontalAlignment')
+    if 'valign' in kw: fmt['verticalAlignment']   = kw['valign']; fields.append('verticalAlignment')
+    if 'wrap' in kw:   fmt['wrapStrategy'] = kw['wrap']; fields.append('wrapStrategy')
+    return {'repeatCell': {
+        'range': _rng(sid, r1, r2, c1, c2),
+        'cell': {'userEnteredFormat': fmt},
+        'fields': 'userEnteredFormat(' + ','.join(fields) + ')'
+    }}
+
+
+def _colw(sid, c, px):
+    return {'updateDimensionProperties': {
+        'range': {'sheetId': sid, 'dimension': 'COLUMNS', 'startIndex': c, 'endIndex': c+1},
+        'properties': {'pixelSize': px}, 'fields': 'pixelSize'
+    }}
+
+
+def _rowh(sid, r, px):
+    return {'updateDimensionProperties': {
+        'range': {'sheetId': sid, 'dimension': 'ROWS', 'startIndex': r, 'endIndex': r+1},
+        'properties': {'pixelSize': px}, 'fields': 'pixelSize'
+    }}
+
+
+def _freeze(sid, rows=1):
+    return {'updateSheetProperties': {
+        'properties': {'sheetId': sid, 'gridProperties': {'frozenRowCount': rows}},
+        'fields': 'gridProperties.frozenRowCount'
+    }}
+
+
+def _borders(sid, r1, r2, c1, c2, color='#D5D8DC'):
+    b = {'style': 'SOLID', 'colorStyle': {'rgbColor': _rgb(color)}}
+    return {'updateBorders': {
+        'range': _rng(sid, r1, r2, c1, c2),
+        'top': b, 'bottom': b, 'left': b, 'right': b,
+        'innerHorizontal': b, 'innerVertical': b
+    }}
+
+
+def _cond(sid, r1, r2, c1, c2, ctype, val, bg, fg=None, bold=False):
+    fmt = {'backgroundColor': _rgb(bg)}
+    if fg or bold:
+        fmt['textFormat'] = {}
+        if fg:   fmt['textFormat']['foregroundColor'] = _rgb(fg)
+        if bold: fmt['textFormat']['bold'] = True
+    return {'addConditionalFormatRule': {
+        'rule': {
+            'ranges': [_rng(sid, r1, r2, c1, c2)],
+            'booleanRule': {
+                'condition': {'type': ctype, 'values': [{'userEnteredValue': val}]},
+                'format': fmt
+            }
+        }, 'index': 0
+    }}
+
+
+def _del_charts(sh, sheet_id):
+    try:
+        meta = sh.fetch_sheet_metadata()
+        for s in meta.get('sheets', []):
+            if s['properties']['sheetId'] == sheet_id:
+                cids = [c['chartId'] for c in s.get('charts', [])]
+                if cids:
+                    sh.batch_update({'requests': [
+                        {'deleteEmbeddedObject': {'objectId': cid}} for cid in cids
+                    ]})
+    except Exception as e:
+        print(f"  Chart cleanup: {e}")
+
+
+def _line_chart(sid, anchor_row, anchor_col, title, x_col, y_col, y_label, w=620, h=320):
+    return {'addChart': {'chart': {
+        'spec': {
+            'title': title,
+            'titleTextFormat': {'bold': True, 'fontSize': 11, 'fontFamily': 'Arial'},
+            'basicChart': {
+                'chartType': 'LINE',
+                'legendPosition': 'BOTTOM_LEGEND',
+                'axis': [
+                    {'position': 'BOTTOM_AXIS', 'title': 'Date'},
+                    {'position': 'LEFT_AXIS',   'title': y_label},
+                ],
+                'domains': [{'domain': {'sourceRange': {'sources': [_rng(sid, 0, 2000, x_col, x_col+1)]}}}],
+                'series': [{'series': {'sourceRange': {'sources': [_rng(sid, 0, 2000, y_col, y_col+1)]}},
+                            'targetAxis': 'LEFT_AXIS'}],
+                'headerCount': 1,
+                'lineSmoothing': True,
+            },
+            'fontName': 'Arial',
+            'backgroundColor': _rgb('#FFFFFF'),
+        },
+        'position': {'overlayPosition': {
+            'anchorCell': {'sheetId': sid, 'rowIndex': anchor_row, 'columnIndex': anchor_col},
+            'widthPixels': w, 'heightPixels': h
+        }}
+    }}}
+
+
+def apply_formatting(sh, n_pos):
+    """Apply professional finance dashboard formatting to all four sheets."""
+    try:
+        meta = sh.fetch_sheet_metadata()
+        ids = {s['properties']['title']: s['properties']['sheetId']
+               for s in meta.get('sheets', [])}
+    except Exception as e:
+        print(f"Formatting meta error: {e}"); return
+
+    did  = ids.get('Dashboard')
+    dlid = ids.get('Daily Log')
+    tlid = ids.get('Trade Log')
+    pid  = ids.get('Performance')
+    C    = _C
+    rq   = []
+
+    # ── Dashboard ─────────────────────────────────────────────────────────
+    if did is not None:
+        pos_rows = max(1, n_pos)
+        pstart   = 20 + pos_rows + 1  # portfolio section start row (after spacer)
+
+        rq += [
+            # Row 0: title banner
+            _cell(did, 0, 1, 0, 9, bg=C['navy'], fg=C['white'], bold=True, size=14, valign='MIDDLE'),
+            _rowh(did, 0, 44),
+            # Row 1: subtitle bar
+            _cell(did, 1, 2, 0, 9, bg='#0F1F3D', fg='#8BA7CC', size=9, valign='MIDDLE'),
+            _rowh(did, 1, 20),
+            # Row 2: spacer
+            _cell(did, 2, 3, 0, 9, bg=C['bgray']),
+            _rowh(did, 2, 5),
+            # Row 3: MARKET OVERVIEW section header
+            _cell(did, 3, 4, 0, 9, bg=C['blue'], fg=C['white'], bold=True, size=10, valign='MIDDLE'),
+            _rowh(did, 3, 28),
+            # Rows 4–7: SPY, QQQ, VIX, Fear & Greed
+            _cell(did, 4, 8, 0, 1, fg=C['dgray'], bold=True),
+            _cell(did, 4, 8, 1, 9, fg=C['dgray']),
+            _cell(did, 4, 5, 0, 9, bg=C['gray']),
+            _cell(did, 6, 7, 0, 9, bg=C['gray']),
+            _borders(did, 4, 8, 0, 2),
+            # Row 8: spacer
+            _cell(did, 8, 9, 0, 9, bg=C['bgray']),
+            _rowh(did, 8, 5),
+            # Row 9: SECTOR ROTATION header + col labels
+            _cell(did, 9, 10, 0, 9, bg=C['blue'], fg=C['white'], bold=True, size=10, valign='MIDDLE'),
+            _cell(did, 9, 10, 1, 3, fg='#A8C4E8', size=9, align='RIGHT'),
+            _rowh(did, 9, 28),
+            # Rows 10–17: 8 sectors
+            _cell(did, 10, 18, 0, 1, fg=C['dgray'], bold=True),
+            _cell(did, 10, 18, 1, 3, fg=C['dgray'], align='RIGHT'),
+            _borders(did, 10, 18, 0, 3),
+            _cond(did, 10, 18, 2, 3, 'TEXT_CONTAINS', '+', C['lgreen'], C['green']),
+            _cond(did, 10, 18, 2, 3, 'TEXT_CONTAINS', '-', C['lred'],   C['red']),
+            # Row 18: spacer
+            _cell(did, 18, 19, 0, 9, bg=C['bgray']),
+            _rowh(did, 18, 5),
+            # Row 19: OPEN POSITIONS header + column labels
+            _cell(did, 19, 20, 0, 9, bg=C['navy'], fg=C['white'], bold=True, size=10, valign='MIDDLE'),
+            _cell(did, 19, 20, 1, 9, fg='#8BA7CC', size=9, align='CENTER'),
+            _rowh(did, 19, 28),
+            # Position data rows
+            _cell(did, 20, 20+pos_rows, 0, 1, fg=C['dgray'], bold=True),
+            _cell(did, 20, 20+pos_rows, 1, 9, fg=C['dgray'], align='CENTER'),
+            _borders(did, 20, 20+pos_rows, 0, 9),
+            _cond(did, 20, 20+pos_rows, 3, 5, 'TEXT_CONTAINS', '+', C['lgreen'], C['green'], True),
+            _cond(did, 20, 20+pos_rows, 3, 5, 'TEXT_CONTAINS', '-', C['lred'],   C['red'],   True),
+        ]
+        for i in range(20, 20 + pos_rows):
+            rq.append(_cell(did, i, i+1, 0, 9, bg=(C['white'] if i % 2 == 0 else C['gray'])))
+
+        # Spacer + portfolio section
+        rq += [
+            _cell(did, 20+pos_rows, 20+pos_rows+1, 0, 9, bg=C['bgray']),
+            _rowh(did, 20+pos_rows, 5),
+            _cell(did, pstart, pstart+1, 0, 9, bg=C['blue'], fg=C['white'], bold=True, size=10),
+            _rowh(did, pstart, 28),
+            _cell(did, pstart+1, pstart+4, 0, 1, fg=C['dgray'], bold=True),
+            _cell(did, pstart+1, pstart+4, 1, 9, fg=C['dgray'], align='RIGHT'),
+            _borders(did, pstart+1, pstart+4, 0, 2),
+        ]
+
+        # Column widths
+        rq += [
+            _colw(did, 0, 165), _colw(did, 1, 100), _colw(did, 2, 90),
+            _colw(did, 3, 80),  _colw(did, 4, 80),  _colw(did, 5, 90),
+            _colw(did, 6, 80),  _colw(did, 7, 90),  _colw(did, 8, 90),
+        ]
+
+    # ── Daily Log ─────────────────────────────────────────────────────────
+    if dlid is not None:
+        rq += [
+            _cell(dlid, 0, 1, 0, 12, bg=C['navy'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
+            _rowh(dlid, 0, 28),
+            _freeze(dlid, rows=1),
+            _cell(dlid, 1, 2000, 0, 12, fg=C['dgray'], size=9),
+            _borders(dlid, 0, 2000, 0, 12),
+            _cond(dlid, 1, 2000, 2, 4, 'TEXT_CONTAINS', '-', C['lred'],   C['red']),
+            _cond(dlid, 1, 2000, 2, 4, 'TEXT_CONTAINS', '+', C['lgreen'], C['green']),
+            _colw(dlid, 0, 100), _colw(dlid, 1, 75),  _colw(dlid, 2, 75),
+            _colw(dlid, 3, 75),  _colw(dlid, 4, 60),  _colw(dlid, 5, 140),
+            _colw(dlid, 6, 95),  _colw(dlid, 7, 80),  _colw(dlid, 8, 85),
+            _colw(dlid, 9, 90),  _colw(dlid, 10, 95), _colw(dlid, 11, 115),
+        ]
+
+    # ── Trade Log ─────────────────────────────────────────────────────────
+    if tlid is not None:
+        rq += [
+            _cell(tlid, 0, 1, 0, 15, bg=C['navy'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
+            _rowh(tlid, 0, 28),
+            _freeze(tlid, rows=1),
+            _cell(tlid, 1, 2000, 0, 15, fg=C['dgray'], size=9),
+            _cell(tlid, 1, 2000, 13, 15, wrap='WRAP'),
+            _borders(tlid, 0, 2000, 0, 15),
+            _colw(tlid, 0, 100), _colw(tlid, 1, 65),  _colw(tlid, 2, 60),
+            _colw(tlid, 3, 75),  _colw(tlid, 4, 80),  _colw(tlid, 5, 90),
+            _colw(tlid, 6, 155), _colw(tlid, 7, 140), _colw(tlid, 8, 140),
+            _colw(tlid, 9, 140), _colw(tlid, 10, 90), _colw(tlid, 11, 75),
+            _colw(tlid, 12, 80), _colw(tlid, 13, 290), _colw(tlid, 14, 210),
+        ]
+
+    # ── Performance ───────────────────────────────────────────────────────
+    if pid is not None:
+        rq += [
+            _cell(pid, 0, 1, 0, 5, bg=C['navy'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
+            _rowh(pid, 0, 28),
+            _freeze(pid, rows=1),
+            _cell(pid, 1, 2000, 0, 5, fg=C['dgray'], size=9),
+            _cell(pid, 1, 2000, 1, 3, align='RIGHT'),
+            _borders(pid, 0, 2000, 0, 5),
+            _colw(pid, 0, 100), _colw(pid, 1, 120),
+            _colw(pid, 2, 110), _colw(pid, 3, 100), _colw(pid, 4, 100),
+        ]
+
+    if rq:
+        try:
+            sh.batch_update({'requests': rq})
+            print("Formatting applied.")
+        except Exception as e:
+            print(f"Formatting batch error: {e}")
+
+    # ── Charts ────────────────────────────────────────────────────────────
+    if pid is not None:
+        _del_charts(sh, pid)
+        try:
+            sh.batch_update({'requests': [
+                _line_chart(pid, 2, 6, 'Portfolio Equity Curve', 0, 1, 'Total Equity ($)', w=650, h=360)
+            ]})
+            print("Performance chart added.")
+        except Exception as e:
+            print(f"Performance chart error: {e}")
+
+    if dlid is not None:
+        _del_charts(sh, dlid)
+        try:
+            sh.batch_update({'requests': [
+                _line_chart(dlid, 2, 13, 'Portfolio Equity Over Time', 0, 11, 'Total Equity ($)', w=560, h=300)
+            ]})
+            print("Daily Log chart added.")
+        except Exception as e:
+            print(f"Daily log chart error: {e}")
+
+
 # ── Slack ─────────────────────────────────────────────────────────────────
 
 def get_sheet():
@@ -550,20 +842,21 @@ def update_sheets(mode, today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
             dash = sh.add_worksheet(title='Dashboard', rows=100, cols=10)
 
         rows = [
-            ['TRADING BOT DASHBOARD', '', f'Last updated: {today}  |  Mode: {mode.upper()}'],
+            ['  TRADING BOT DASHBOARD'],
+            [f'  Last Updated: {today}   ·   Session: {mode.upper()}'],
             [''],
-            ['── MARKET ─────────────────────────────'],
+            ['  MARKET OVERVIEW'],
             ['SPY', f'{spy_chg:+.2f}%'],
             ['QQQ', f'{qqq_chg:+.2f}%'],
             ['VIX', f'{vix:.1f}'],
             ['Fear & Greed', fg_label(fg_score)],
             [''],
-            ['── SECTORS ────────────────────────────', 'Change', 'vs SPY'],
+            ['  SECTOR ROTATION', 'Change', 'vs SPY'],
         ]
         for sec, d in sorted(sector_perf.items(), key=lambda x: x[1]['rs'], reverse=True):
             rows.append([sec, f"{d['chg']:+.2f}%", f"{d['rs']:+.2f}%"])
         rows.append([''])
-        rows.append(['── OPEN POSITIONS ─────────────────────', 'Entry', 'Current', 'P&L %', 'P&L $', 'Stop', 'To Stop', 'Target', 'To Target'])
+        rows.append(['  OPEN POSITIONS', 'Entry', 'Current', 'P&L %', 'P&L $', 'Stop', 'To Stop', 'Target', 'To Target'])
         for sym, h in held.items():
             dpnl   = (h['price'] - h['cost']) * h['qty']
             tostop = (h['price'] - h['stop']) / h['price'] * 100
@@ -574,7 +867,7 @@ def update_sheets(mode, today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
                          f"${h['cost']*1.20:.2f}", f"{totgt:.1f}%"])
         if not held:
             rows.append(['No open positions'])
-        rows += [[''], ['── PORTFOLIO ──────────────────────────'],
+        rows += [[''], ['  PORTFOLIO SUMMARY'],
                  ['Cash', f'${buying_power:.2f}'],
                  ['Total Equity', f'${equity:.2f}'],
                  ['# Positions', str(len(held))]]
@@ -625,12 +918,14 @@ def update_sheets(mode, today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
         # ── Performance (daily equity tracking) ───────────────────────────
         hdrs = ['Date','Total Equity','Cash','# Positions','Trades Today']
         ws = ensure_tab(sh, 'Performance', hdrs)
-        ws.append_row([today, f'${equity:.2f}', f'${buying_power:.2f}',
-                       str(len(held)), str(len(trades_done))],
+        ws.append_row([today, round(equity, 2), round(buying_power, 2),
+                       len(held), len(trades_done)],
                       value_input_option='USER_ENTERED')
         print("Performance log appended.")
     except Exception as e:
         print(f"Performance log error: {e}")
+
+    apply_formatting(sh, len(held))
 
 
 def slack_send(msg):
