@@ -575,6 +575,9 @@ def main():
     mode  = sys.argv[1] if len(sys.argv) > 1 else 'morning'
     print(f"[{today}] mode={mode}")
 
+    label = "Morning Analysis" if mode == 'morning' else "EOD Recap"
+    slack_send(f"{SLACK_MENTION} :robot_face: *{label} started* — {today} | Analysis running, report incoming...")
+
     rh_login()
     buying_power = get_buying_power()
 
