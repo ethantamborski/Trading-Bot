@@ -1060,7 +1060,7 @@ def apply_formatting(sh, n_pos):
             _cell(shid, 1, 2000, 0, 9, fg=C['dgray'], size=9),
             _borders(shid, 0, 2000, 0, 9, C['border']),
             _cond(shid, 1, 2000, 1, 9, 'NUMBER_GREATER_THAN_EQ', '0', C['lpos'], C['pos']),
-            _cond(shid, 1, 2000, 1, 9, 'NUMBER_LESS_THAN',        '0', C['lneg'], C['neg']),
+            _cond(shid, 1, 2000, 1, 9, 'NUMBER_LESS',             '0', C['lneg'], C['neg']),
             _colw(shid, 0, 100),
         ]
         for i in range(1, 9):
@@ -1119,7 +1119,7 @@ def apply_formatting(sh, n_pos):
         _del_charts(sh, dlid)
         try:
             sh.batch_update({'requests': [
-                _line_chart(dlid, 2, 14, 'Portfolio Equity Over Time', 0, 13, 'Total Equity ($)', w=560, h=300)
+                _line_chart(dlid, 2, 10, 'Portfolio Equity Over Time', 0, 13, 'Total Equity ($)', w=560, h=300)
             ]})
             print("Daily Log chart added.")
         except Exception as e:
