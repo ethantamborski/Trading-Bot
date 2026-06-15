@@ -606,14 +606,20 @@ def main():
     if mode == 'eod':
         lines = [f"{SLACK_MENTION} 📊 *EOD Recap — {today}*\n"]
         lines.append(f"*Market:* SPY {spy_chg:+.2f}% | QQQ {qqq_chg:+.2f}% | VIX {vix:.1f} | {fg_label(fg_score)}\n")
-        top3 = sorted(sector_perf.items(), key=lambda x: x[1]['rs'], reverse=True)[:3]
-        lines.append('*Top sectors:* ' + ' | '.join([f"{s}: {v['chg']:+.1f}%" for s, v in top3]))
+        all_sec = sorted(sector_perf.items(), key=lambda x: x[1]['rs'], reverse=True)
+        lines.append('*Sectors:* ' + ' | '.join([f"{s}: {v['chg']:+.1f}%" for s, v in all_sec]))
         lines.append('')
         if held:
             lines.append('*Open positions:*')
             for sym, h in held.items():
                 icon = '🟢' if h['pnl'] > 0 else '🔴'
-                lines.append(f"  {icon} {sym}: ${h['price']:.2f} ({h['pnl']:+.1f}%) | Stop ${h['stop']:.2f}")
+                dollar_pnl = (h['price'] - h['cost']) * h['qty']
+                to_stop = (h['price'] - h['stop']) / h['price'] * 100
+                lines.append(
+                    f"  {icon} *{sym}* | Entry ${h['cost']:.2f} → Now ${h['price']:.2f} | "
+                    f"P&L: *{h['pnl']:+.1f}%* (${dollar_pnl:+.2f}) | "
+                    f"Stop ${h['stop']:.2f} ({to_stop:.1f}% away)"
+                )
         else:
             lines.append('No open positions.')
         if trailing_log:
@@ -718,8 +724,9 @@ def main():
 
     lines.append(f"*Market:* SPY {spy_chg:+.2f}% | QQQ {qqq_chg:+.2f}% | VIX {vix:.1f}")
     lines.append(f"*Fear & Greed:* {fg_label(fg_score)}")
-    top4 = sorted(sector_perf.items(), key=lambda x: x[1]['rs'], reverse=True)[:4]
-    lines.append('*Leading sectors:* ' + ' | '.join([f"{s}: {v['chg']:+.1f}%" for s, v in top4]))
+    all_sectors = sorted(sector_perf.items(), key=lambda x: x[1]['rs'], reverse=True)
+    sector_str = ' | '.join([f"{s}: {v['chg']:+.1f}%" for s, v in all_sectors])
+    lines.append(f'*All sectors (vs SPY):* {sector_str}')
     if vix_block:
         lines.append('⛔ *VIX > 40 — no new positions today*')
     elif vix_reduce:
@@ -748,7 +755,15 @@ def main():
         lines.append('*Open positions:*')
         for sym, h in held.items():
             icon = '🟢' if h['pnl'] > 0 else '🔴'
-            lines.append(f"  {icon} {sym}: ${h['price']:.2f} ({h['pnl']:+.1f}%) | Stop ${h['stop']:.2f}")
+            dollar_pnl = (h['price'] - h['cost']) * h['qty']
+            to_stop = (h['price'] - h['stop']) / h['price'] * 100
+            to_target = (h['cost'] * 1.20 - h['price']) / h['price'] * 100
+            lines.append(
+                f"  {icon} *{sym}* | Entry ${h['cost']:.2f} → Now ${h['price']:.2f} | "
+                f"P&L: *{h['pnl']:+.1f}%* (${dollar_pnl:+.2f}) | "
+                f"Stop ${h['stop']:.2f} ({to_stop:.1f}% away) | "
+                f"Target ${h['cost']*1.20:.2f} ({to_target:.1f}% away)"
+            )
         lines.append('')
 
     if trades_done:
