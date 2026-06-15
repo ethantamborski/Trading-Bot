@@ -462,7 +462,11 @@ def load_positions(buying_power):
             sym   = instr['symbol']
             qty   = float(pos['quantity'])
             cost  = float(pos['average_buy_price'])
+            if cost <= 0 or qty <= 0:
+                print(f"  Skipping {sym}: zero cost/qty from Robinhood")
+                continue
             price = float((r.stocks.get_latest_price(sym) or [cost])[0])
+            price = price if price > 0 else cost
             pnl   = (price - cost) / cost * 100
 
             if pnl >= TAKE_PROFIT_AT * 100:
