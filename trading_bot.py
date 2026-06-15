@@ -25,6 +25,7 @@ ANTHROPIC_API_KEY  = os.environ['ANTHROPIC_API_KEY']
 GOOGLE_SHEET_ID    = os.environ.get('GOOGLE_SHEET_ID', '')
 GCLOUD_KEY_PATH    = '/opt/trading-bot/gcloud.json'
 SHEET_URL          = f'https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}'
+SESSION_DATE       = os.environ.get('SESSION_DATE', '')  # YYYY-MM-DD when session was last created
 
 ACCOUNT_NUMBER = '456166776'
 SLACK_MENTION  = '<@U0B8ZNEB9N2>'
@@ -965,6 +966,36 @@ def build_trade_report(t):
     return '\n'.join(lines)
 
 
+# ── Session expiry warning ────────────────────────────────────────────────
+
+def check_session_expiry():
+    if not SESSION_DATE:
+        return
+    try:
+        from datetime import date as _date
+        created  = _date.fromisoformat(SESSION_DATE)
+        expires  = created.replace(year=created.year, month=created.month, day=created.day)
+        from datetime import timedelta
+        expires  = created + timedelta(days=30)
+        days_left = (expires - _date.today()).days
+        if days_left <= 1:
+            slack_send(
+                f"{SLACK_MENTION} 🔑 *Robinhood session expires {'TODAY' if days_left <= 0 else 'TOMORROW'}* — renew it now or the bot will stop trading.\n\n"
+                f"*Here's exactly what to do (takes 2 minutes):*\n"
+                f"1️⃣  Open Terminal on your Mac\n"
+                f"2️⃣  Run: `cd ~/Documents/Claude/trading/github-trading-bot && python3 setup_device_token.py`\n"
+                f"3️⃣  Enter your Robinhood email and password when prompted (approve any SMS code)\n"
+                f"4️⃣  It saves a file called `session.txt` — open it and copy the entire contents\n"
+                f"5️⃣  SSH into the server: `ssh root@167.99.239.217`\n"
+                f"6️⃣  Run: `python3 -c \"import os; val=input('Paste session: '); lines=open('/opt/trading-bot/.env').read().split('\\n'); lines=[l if not l.startswith('ROBINHOOD_SESSION') else f'ROBINHOOD_SESSION={{val}}' for l in lines]; open('/opt/trading-bot/.env','w').write('\\n'.join(lines))\"`\n"
+                f"7️⃣  Paste the session value and hit Enter\n"
+                f"8️⃣  Update the date: `sed -i 's/SESSION_DATE=.*/SESSION_DATE=$(date +%Y-%m-%d)/' /opt/trading-bot/.env`\n"
+                f"✅  Done — bot will log in normally at next run."
+            )
+    except Exception as e:
+        print(f"Session expiry check error: {e}")
+
+
 # ── Login ─────────────────────────────────────────────────────────────────
 
 def rh_login():
@@ -1002,6 +1033,9 @@ def main():
 
     label = "Morning Analysis" if mode == 'morning' else "EOD Recap"
     slack_send(f"{SLACK_MENTION} :robot_face: *{label} started* — {today} | Analysis running, report incoming...")
+
+    if mode == 'morning':
+        check_session_expiry()
 
     rh_login()
     buying_power = get_buying_power()
