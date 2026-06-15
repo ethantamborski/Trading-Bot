@@ -468,7 +468,7 @@ def load_positions(buying_power):
             if pnl >= TAKE_PROFIT_AT * 100:
                 print(f"  TAKE PROFIT: {sym} +{pnl:.1f}%")
                 r.orders.order_sell_market(sym, qty, account_number=ACCOUNT_NUMBER, jsonify=True)
-                targets_hit.append({'symbol': sym, 'price': price, 'pnl': pnl})
+                targets_hit.append({'symbol': sym, 'price': price, 'pnl': pnl, 'cost': cost, 'qty': qty})
                 buying_power += qty * price
                 continue
 
@@ -478,7 +478,7 @@ def load_positions(buying_power):
                 if price <= effective_stop:
                     print(f"  TRAIL STOP (+5%): {sym}")
                     r.orders.order_sell_market(sym, qty, account_number=ACCOUNT_NUMBER, jsonify=True)
-                    stops_hit.append({'symbol': sym, 'price': price, 'pnl': pnl, 'type': 'trail +5%'})
+                    stops_hit.append({'symbol': sym, 'price': price, 'pnl': pnl, 'type': 'trail +5%', 'cost': cost, 'qty': qty})
                     buying_power += qty * price
                     continue
                 stop = effective_stop
@@ -489,7 +489,7 @@ def load_positions(buying_power):
                 if price <= effective_stop:
                     print(f"  TRAIL STOP (breakeven): {sym}")
                     r.orders.order_sell_market(sym, qty, account_number=ACCOUNT_NUMBER, jsonify=True)
-                    stops_hit.append({'symbol': sym, 'price': price, 'pnl': pnl, 'type': 'trail breakeven'})
+                    stops_hit.append({'symbol': sym, 'price': price, 'pnl': pnl, 'type': 'trail breakeven', 'cost': cost, 'qty': qty})
                     buying_power += qty * price
                     continue
                 stop = effective_stop
@@ -499,7 +499,7 @@ def load_positions(buying_power):
                 if price <= stop:
                     print(f"  HARD STOP: {sym} @ ${price:.2f}")
                     r.orders.order_sell_market(sym, qty, account_number=ACCOUNT_NUMBER, jsonify=True)
-                    stops_hit.append({'symbol': sym, 'price': price, 'pnl': pnl, 'type': 'hard stop -12%'})
+                    stops_hit.append({'symbol': sym, 'price': price, 'pnl': pnl, 'type': 'hard stop -12%', 'cost': cost, 'qty': qty})
                     buying_power += qty * price
                     continue
 
@@ -513,11 +513,12 @@ def load_positions(buying_power):
 # ── Sheets formatting helpers ─────────────────────────────────────────────
 
 _C = {
-    'navy':   '#1B2B4B', 'blue':   '#2E5FA3', 'lblue':  '#EBF0FA',
-    'green':  '#0F7B3F', 'lgreen': '#D5F5E3', 'red':    '#C0392B',
-    'lred':   '#FADBD8', 'gold':   '#D4AC0D', 'white':  '#FFFFFF',
-    'gray':   '#F7F9FC', 'bgray':  '#E8EDF5', 'dgray':  '#2C3E50',
-    'border': '#D5D8DC',
+    'blk':   '#080E0A', 'dkgrn': '#0C2A17', 'grn':   '#14532D',
+    'mgrn':  '#1A7A40', 'lgrn':  '#A8D8B9', 'mint':  '#E8F5EE',
+    'xmint': '#F2FAF6', 'white': '#FFFFFF',  'lgray': '#F4F6F4',
+    'mgray': '#5A7A62', 'dgray': '#162219',  'border':'#B8D4C0',
+    'pos':   '#0F7B3F', 'lpos':  '#D5F5E3',  'neg':   '#C0392B',
+    'lneg':  '#FADBD8',
 }
 
 
@@ -640,8 +641,214 @@ def _line_chart(sid, anchor_row, anchor_col, title, x_col, y_col, y_label, w=620
     }}}
 
 
+def get_prev_equity(sh):
+    try:
+        ws = sh.worksheet('Performance')
+        vals = ws.get_all_values()
+        if len(vals) > 1:
+            return float(vals[-1][1])
+    except Exception:
+        pass
+    return None
+
+
+def update_risk_monitor(sh, today, held, equity):
+    try:
+        try:
+            ws = sh.worksheet('Risk Monitor')
+            ws.clear()
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title='Risk Monitor', rows=200, cols=13)
+
+        hdrs = ['Symbol','% of Portfolio','Entry','Current','P&L %','P&L $',
+                'Stop','To Stop %','Target','To Target %','R/R Ratio','Days Held']
+        rows = [hdrs, [f'Last Updated: {today}', '', '', '', '', '', '', '', '', '', '', '']]
+
+        # Try reading Trade Journal for entry dates
+        entry_dates = {}
+        try:
+            tj = sh.worksheet('Trade Journal')
+            tj_vals = tj.get_all_values()
+            for row in tj_vals[1:]:
+                if len(row) >= 2:
+                    entry_dates[row[1]] = row[0]  # symbol -> date
+        except Exception:
+            pass
+
+        if held:
+            from datetime import date as _date
+            for sym, h in held.items():
+                px       = h['price'] if h['price'] > 0 else h['cost']
+                pct_port = px * h['qty'] / equity * 100 if equity > 0 else 0
+                dpnl     = (px - h['cost']) * h['qty']
+                tostop   = (px - h['stop']) / px * 100
+                totgt    = (h['cost'] * 1.20 - px) / px * 100
+                rr       = abs(totgt / tostop) if tostop != 0 else 0
+                # days held
+                days_held = '—'
+                if sym in entry_dates:
+                    try:
+                        entry_d = _date.fromisoformat(entry_dates[sym])
+                        days_held = str((_date.today() - entry_d).days)
+                    except Exception:
+                        pass
+                rows.append([
+                    sym, f'{pct_port:.1f}%', f'${h["cost"]:.2f}', f'${px:.2f}',
+                    f'{h["pnl"]:+.1f}%', f'${dpnl:+.2f}',
+                    f'${h["stop"]:.2f}', f'{tostop:.1f}%',
+                    f'${h["cost"]*1.20:.2f}', f'{totgt:.1f}%',
+                    f'{rr:.1f}x', days_held
+                ])
+        else:
+            rows.append(['No open positions', '', '', '', '', '', '', '', '', '', '', ''])
+
+        # Summary block
+        max_loss = sum((h['stop'] - h['price']) * h['qty'] for h in held.values()) if held else 0
+        at_risk  = sum(h['price'] * h['qty'] for h in held.values()) if held else 0
+        rows += [
+            [''],
+            ['PORTFOLIO RISK', '', '', '', '', '', '', '', '', '', '', ''],
+            ['Max loss (all stops)', f'${max_loss:.2f}', '', '', '', '', '', '', '', '', '', ''],
+            ['Capital at risk', f'${at_risk:.2f}', '', '', '', '', '', '', '', '', '', ''],
+        ]
+
+        ws.update(rows, 'A1')
+        print("Risk Monitor updated.")
+    except Exception as e:
+        print(f"Risk Monitor error: {e}")
+
+
+def update_market_pulse(sh, today, mode, spy_chg, qqq_chg, iwm_chg, vix, fg_score):
+    try:
+        hdrs = ['Date','Mode','SPY %','QQQ %','IWM %','VIX','F&G Score','F&G Label']
+        ws = ensure_tab(sh, 'Market Pulse', hdrs)
+        ws.append_row([today, mode, f'{spy_chg:+.2f}%', f'{qqq_chg:+.2f}%',
+                       f'{iwm_chg:+.2f}%', f'{vix:.1f}', fg_score, fg_label(fg_score)],
+                      value_input_option='RAW')
+        print("Market Pulse appended.")
+    except Exception as e:
+        print(f"Market Pulse error: {e}")
+
+
+def update_sector_history(sh, today, sector_perf):
+    try:
+        SECTOR_ORDER = ['Technology','Healthcare','Financials','Energy',
+                        'Consumer Disc','Industrials','Communication','Materials']
+        hdrs = ['Date'] + SECTOR_ORDER
+        ws = ensure_tab(sh, 'Sector History', hdrs)
+        row = [today] + [round(sector_perf.get(s, {}).get('chg', 0), 2) for s in SECTOR_ORDER]
+        ws.append_row(row, value_input_option='USER_ENTERED')
+        print("Sector History appended.")
+    except Exception as e:
+        print(f"Sector History error: {e}")
+
+
+def update_closed_trades(sh, today, stops_hit, targets_hit):
+    try:
+        if not stops_hit and not targets_hit:
+            return
+        hdrs = ['Date','Symbol','Exit Type','Entry Price','Exit Price','Qty','P&L %','P&L $']
+        ws = ensure_tab(sh, 'Closed Trades', hdrs)
+        for t in targets_hit:
+            pnl_d = (t['price'] - t['cost']) * t['qty']
+            ws.append_row([today, t['symbol'], 'target +20%',
+                           round(t['cost'], 2), round(t['price'], 2), round(t['qty'], 4),
+                           round(t['pnl'], 2), round(pnl_d, 2)],
+                          value_input_option='USER_ENTERED')
+        for s in stops_hit:
+            pnl_d = (s['price'] - s['cost']) * s['qty']
+            ws.append_row([today, s['symbol'], s['type'],
+                           round(s['cost'], 2), round(s['price'], 2), round(s['qty'], 4),
+                           round(s['pnl'], 2), round(pnl_d, 2)],
+                          value_input_option='USER_ENTERED')
+        print(f"Closed Trades: {len(stops_hit)+len(targets_hit)} exits logged.")
+    except Exception as e:
+        print(f"Closed Trades error: {e}")
+
+
+def update_analytics(sh, today):
+    try:
+        try:
+            ws = sh.worksheet('Analytics')
+            ws.clear()
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title='Analytics', rows=100, cols=6)
+
+        # Read Closed Trades
+        closed = []
+        try:
+            ct_vals = sh.worksheet('Closed Trades').get_all_values()
+            for row in ct_vals[1:]:
+                if len(row) >= 8:
+                    try:
+                        closed.append({'symbol': row[1], 'exit_type': row[2],
+                                       'pnl_pct': float(row[6]), 'pnl_d': float(row[7])})
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Read Trade Journal for open trades and conviction
+        open_count = 0
+        avg_conv   = None
+        try:
+            tj_vals = sh.worksheet('Trade Journal').get_all_values()
+            open_count = max(0, len(tj_vals) - 1)
+            convs = []
+            for row in tj_vals[1:]:
+                if len(row) > 5:
+                    try:
+                        convs.append(float(row[5].split('/')[0]))
+                    except Exception:
+                        pass
+            if convs:
+                avg_conv = sum(convs) / len(convs)
+        except Exception:
+            pass
+
+        wins   = [t for t in closed if t['pnl_d'] > 0]
+        losses = [t for t in closed if t['pnl_d'] <= 0]
+        tc     = len(closed)
+        wr     = len(wins) / tc * 100 if tc else None
+        aw     = sum(t['pnl_d'] for t in wins)  / len(wins)  if wins   else None
+        al     = sum(t['pnl_d'] for t in losses) / len(losses) if losses else None
+        pf     = abs(sum(t['pnl_d'] for t in wins)) / abs(sum(t['pnl_d'] for t in losses)) \
+                 if wins and losses and sum(t['pnl_d'] for t in losses) != 0 else None
+        total_pnl = sum(t['pnl_d'] for t in closed)
+        best  = max(closed, key=lambda t: t['pnl_d']) if closed else None
+        worst = min(closed, key=lambda t: t['pnl_d']) if closed else None
+        tgts  = sum(1 for t in closed if 'target' in t['exit_type'])
+        stps  = sum(1 for t in closed if 'stop'   in t['exit_type'])
+
+        NA = '— awaiting data'
+        rows = [
+            ['  TRADE ANALYTICS', '', f'Updated: {today}'],
+            [''],
+            ['  PERFORMANCE SUMMARY'],
+            ['Total Trades Taken',    str(open_count + tc)],
+            ['Currently Open',        str(open_count)],
+            ['Closed Trades',         str(tc)],
+            ['Win Rate',              f'{wr:.1f}%'         if wr  is not None else NA],
+            ['Profit Factor',         f'{pf:.2f}x'         if pf  is not None else NA],
+            ['Avg Conviction Score',  f'{avg_conv:.1f}/10' if avg_conv         else NA],
+            [''],
+            ['  P&L BREAKDOWN'],
+            ['Total Closed P&L',      f'${total_pnl:+.2f}' if closed else NA],
+            ['Avg Winning Trade',     f'${aw:+.2f}'         if aw   is not None else NA],
+            ['Avg Losing Trade',      f'${al:+.2f}'         if al   is not None else NA],
+            ['Targets Hit (+20%)',    str(tgts)],
+            ['Stops Hit',             str(stps)],
+            ['Best Trade',            f"{best['symbol']}  {best['pnl_pct']:+.1f}%"  if best  else NA],
+            ['Worst Trade',           f"{worst['symbol']} {worst['pnl_pct']:+.1f}%" if worst else NA],
+        ]
+        ws.update(rows, 'A1')
+        print("Analytics updated.")
+    except Exception as e:
+        print(f"Analytics error: {e}")
+
+
 def apply_formatting(sh, n_pos):
-    """Apply professional finance dashboard formatting to all four sheets."""
+    """Apply green/black/white dashboard formatting to all sheets."""
     try:
         meta = sh.fetch_sheet_metadata()
         ids = {s['properties']['title']: s['properties']['sheetId']
@@ -649,76 +856,109 @@ def apply_formatting(sh, n_pos):
     except Exception as e:
         print(f"Formatting meta error: {e}"); return
 
-    did  = ids.get('Dashboard')
-    dlid = ids.get('Daily Log')
-    tlid = ids.get('Trade Log')
-    pid  = ids.get('Performance')
-    C    = _C
-    rq   = []
+    did   = ids.get('Dashboard')
+    dlid  = ids.get('Daily Log')
+    tjid  = ids.get('Trade Journal')
+    pid   = ids.get('Performance')
+    rmid  = ids.get('Risk Monitor')
+    mpid  = ids.get('Market Pulse')
+    shid  = ids.get('Sector History')
+    ctid  = ids.get('Closed Trades')
+    anid  = ids.get('Analytics')
+    C     = _C
+    rq    = []
 
     # ── Dashboard ─────────────────────────────────────────────────────────
     if did is not None:
         pos_rows = max(1, n_pos)
-        pstart   = 20 + pos_rows + 1  # portfolio section start row (after spacer)
+        # Row layout:
+        # 0: title, 1: subtitle, 2: spacer, 3: KEY METRICS header
+        # 4: metric labels, 5: metric values, 6: spacer
+        # 7: MARKET OVERVIEW header, 8-12: market rows (SPY/QQQ/IWM/VIX/F&G)
+        # 13: spacer, 14: SECTOR ROTATION header, 15-22: 8 sector rows
+        # 23: spacer, 24: OPEN POSITIONS header, 25 to 25+pos_rows-1: position rows
+        # pstart = 26 + pos_rows: PORTFOLIO SUMMARY header, pstart+1 to pstart+3: data
+        pstart = 26 + pos_rows
 
         rq += [
             # Row 0: title banner
-            _cell(did, 0, 1, 0, 9, bg=C['navy'], fg=C['white'], bold=True, size=14, valign='MIDDLE'),
+            _cell(did, 0, 1, 0, 9, bg=C['blk'], fg=C['white'], bold=True, size=14, valign='MIDDLE'),
             _rowh(did, 0, 44),
             # Row 1: subtitle bar
-            _cell(did, 1, 2, 0, 9, bg='#0F1F3D', fg='#8BA7CC', size=9, valign='MIDDLE'),
+            _cell(did, 1, 2, 0, 9, bg=C['dkgrn'], fg=C['lgrn'], size=9, valign='MIDDLE'),
             _rowh(did, 1, 20),
             # Row 2: spacer
-            _cell(did, 2, 3, 0, 9, bg=C['bgray']),
+            _cell(did, 2, 3, 0, 9, bg=C['mint']),
             _rowh(did, 2, 5),
-            # Row 3: MARKET OVERVIEW section header
-            _cell(did, 3, 4, 0, 9, bg=C['blue'], fg=C['white'], bold=True, size=10, valign='MIDDLE'),
+            # Row 3: KEY METRICS header
+            _cell(did, 3, 4, 0, 9, bg=C['grn'], fg=C['white'], bold=True, size=10, valign='MIDDLE'),
             _rowh(did, 3, 28),
-            # Rows 4–7: SPY, QQQ, VIX, Fear & Greed
-            _cell(did, 4, 8, 0, 1, fg=C['dgray'], bold=True),
-            _cell(did, 4, 8, 1, 9, fg=C['dgray']),
-            _cell(did, 4, 5, 0, 9, bg=C['gray']),
-            _cell(did, 6, 7, 0, 9, bg=C['gray']),
-            _borders(did, 4, 8, 0, 2),
-            # Row 8: spacer
-            _cell(did, 8, 9, 0, 9, bg=C['bgray']),
-            _rowh(did, 8, 5),
-            # Row 9: SECTOR ROTATION header + col labels
-            _cell(did, 9, 10, 0, 9, bg=C['blue'], fg=C['white'], bold=True, size=10, valign='MIDDLE'),
-            _cell(did, 9, 10, 1, 3, fg='#A8C4E8', size=9, align='RIGHT'),
-            _rowh(did, 9, 28),
-            # Rows 10–17: 8 sectors
-            _cell(did, 10, 18, 0, 1, fg=C['dgray'], bold=True),
-            _cell(did, 10, 18, 1, 3, fg=C['dgray'], align='RIGHT'),
-            _borders(did, 10, 18, 0, 3),
-            _cond(did, 10, 18, 2, 3, 'TEXT_CONTAINS', '+', C['lgreen'], C['green']),
-            _cond(did, 10, 18, 2, 3, 'TEXT_CONTAINS', '-', C['lred'],   C['red']),
-            # Row 18: spacer
-            _cell(did, 18, 19, 0, 9, bg=C['bgray']),
-            _rowh(did, 18, 5),
-            # Row 19: OPEN POSITIONS header + column labels
-            _cell(did, 19, 20, 0, 9, bg=C['navy'], fg=C['white'], bold=True, size=10, valign='MIDDLE'),
-            _cell(did, 19, 20, 1, 9, fg='#8BA7CC', size=9, align='CENTER'),
-            _rowh(did, 19, 28),
-            # Position data rows
-            _cell(did, 20, 20+pos_rows, 0, 1, fg=C['dgray'], bold=True),
-            _cell(did, 20, 20+pos_rows, 1, 9, fg=C['dgray'], align='CENTER'),
-            _borders(did, 20, 20+pos_rows, 0, 9),
-            _cond(did, 20, 20+pos_rows, 3, 5, 'TEXT_CONTAINS', '+', C['lgreen'], C['green'], True),
-            _cond(did, 20, 20+pos_rows, 3, 5, 'TEXT_CONTAINS', '-', C['lred'],   C['red'],   True),
+            # Row 4: metric labels
+            _cell(did, 4, 5, 0, 9, bg=C['dkgrn'], fg=C['lgrn'], bold=True, size=9, valign='MIDDLE'),
+            _rowh(did, 4, 22),
+            # Row 5: metric values
+            _cell(did, 5, 6, 0, 9, bg=C['dgray'], fg=C['white'], bold=True, size=12, valign='MIDDLE'),
+            _rowh(did, 5, 36),
+            # Row 6: spacer
+            _cell(did, 6, 7, 0, 9, bg=C['mint']),
+            _rowh(did, 6, 5),
+            # Row 7: MARKET OVERVIEW header
+            _cell(did, 7, 8, 0, 9, bg=C['grn'], fg=C['white'], bold=True, size=10, valign='MIDDLE'),
+            _rowh(did, 7, 28),
+            # Rows 8-12: SPY, QQQ, IWM, VIX, F&G
+            _cell(did, 8, 13, 0, 1, fg=C['dgray'], bold=True),
+            _cell(did, 8, 13, 1, 9, fg=C['dgray']),
+            _cell(did, 8, 9,  0, 9, bg=C['white']),
+            _cell(did, 9, 10, 0, 9, bg=C['xmint']),
+            _cell(did, 10, 11, 0, 9, bg=C['white']),
+            _cell(did, 11, 12, 0, 9, bg=C['xmint']),
+            _cell(did, 12, 13, 0, 9, bg=C['white']),
+            _borders(did, 8, 13, 0, 2, C['border']),
+            # Row 13: spacer
+            _cell(did, 13, 14, 0, 9, bg=C['mint']),
+            _rowh(did, 13, 5),
+            # Row 14: SECTOR ROTATION header
+            _cell(did, 14, 15, 0, 9, bg=C['dkgrn'], fg=C['white'], bold=True, size=10, valign='MIDDLE'),
+            _cell(did, 14, 15, 1, 3, fg=C['lgrn'], size=9, align='RIGHT'),
+            _rowh(did, 14, 28),
+            # Rows 15-22: 8 sectors
+            _cell(did, 15, 23, 0, 1, fg=C['dgray'], bold=True),
+            _cell(did, 15, 23, 1, 3, fg=C['dgray'], align='RIGHT'),
+            _borders(did, 15, 23, 0, 3, C['border']),
+            _cond(did, 15, 23, 2, 3, 'TEXT_CONTAINS', '+', C['lpos'], C['pos']),
+            _cond(did, 15, 23, 2, 3, 'TEXT_CONTAINS', '-', C['lneg'], C['neg']),
         ]
-        for i in range(20, 20 + pos_rows):
-            rq.append(_cell(did, i, i+1, 0, 9, bg=(C['white'] if i % 2 == 0 else C['gray'])))
+        for i in range(15, 23):
+            rq.append(_cell(did, i, i+1, 0, 9, bg=(C['white'] if i % 2 == 1 else C['xmint'])))
 
-        # Spacer + portfolio section
         rq += [
-            _cell(did, 20+pos_rows, 20+pos_rows+1, 0, 9, bg=C['bgray']),
-            _rowh(did, 20+pos_rows, 5),
-            _cell(did, pstart, pstart+1, 0, 9, bg=C['blue'], fg=C['white'], bold=True, size=10),
+            # Row 23: spacer
+            _cell(did, 23, 24, 0, 9, bg=C['mint']),
+            _rowh(did, 23, 5),
+            # Row 24: OPEN POSITIONS header
+            _cell(did, 24, 25, 0, 9, bg=C['blk'], fg=C['white'], bold=True, size=10, valign='MIDDLE'),
+            _cell(did, 24, 25, 1, 9, fg=C['lgrn'], size=9, align='CENTER'),
+            _rowh(did, 24, 28),
+            # Position data rows 25 to 25+pos_rows-1
+            _cell(did, 25, 25+pos_rows, 0, 1, fg=C['dgray'], bold=True),
+            _cell(did, 25, 25+pos_rows, 1, 9, fg=C['dgray'], align='CENTER'),
+            _borders(did, 25, 25+pos_rows, 0, 9, C['border']),
+            _cond(did, 25, 25+pos_rows, 3, 5, 'TEXT_CONTAINS', '+', C['lpos'], C['pos'], True),
+            _cond(did, 25, 25+pos_rows, 3, 5, 'TEXT_CONTAINS', '-', C['lneg'], C['neg'], True),
+        ]
+        for i in range(25, 25 + pos_rows):
+            rq.append(_cell(did, i, i+1, 0, 9, bg=(C['white'] if i % 2 == 1 else C['xmint'])))
+
+        rq += [
+            # Spacer after positions
+            _cell(did, 25+pos_rows, 26+pos_rows, 0, 9, bg=C['mint']),
+            _rowh(did, 25+pos_rows, 5),
+            # Portfolio summary header
+            _cell(did, pstart, pstart+1, 0, 9, bg=C['grn'], fg=C['white'], bold=True, size=10),
             _rowh(did, pstart, 28),
             _cell(did, pstart+1, pstart+4, 0, 1, fg=C['dgray'], bold=True),
             _cell(did, pstart+1, pstart+4, 1, 9, fg=C['dgray'], align='RIGHT'),
-            _borders(did, pstart+1, pstart+4, 0, 2),
+            _borders(did, pstart+1, pstart+4, 0, 2, C['border']),
         ]
 
         # Column widths
@@ -731,46 +971,130 @@ def apply_formatting(sh, n_pos):
     # ── Daily Log ─────────────────────────────────────────────────────────
     if dlid is not None:
         rq += [
-            _cell(dlid, 0, 1, 0, 12, bg=C['navy'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
+            _cell(dlid, 0, 1, 0, 14, bg=C['dkgrn'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
             _rowh(dlid, 0, 28),
             _freeze(dlid, rows=1),
-            _cell(dlid, 1, 2000, 0, 12, fg=C['dgray'], size=9),
-            _borders(dlid, 0, 2000, 0, 12),
-            _cond(dlid, 1, 2000, 2, 4, 'TEXT_CONTAINS', '-', C['lred'],   C['red']),
-            _cond(dlid, 1, 2000, 2, 4, 'TEXT_CONTAINS', '+', C['lgreen'], C['green']),
+            _cell(dlid, 1, 2000, 0, 14, fg=C['dgray'], size=9),
+            _borders(dlid, 0, 2000, 0, 14, C['border']),
+            _cond(dlid, 1, 2000, 2, 5, 'TEXT_CONTAINS', '-', C['lneg'], C['neg']),
+            _cond(dlid, 1, 2000, 2, 5, 'TEXT_CONTAINS', '+', C['lpos'], C['pos']),
             _colw(dlid, 0, 100), _colw(dlid, 1, 75),  _colw(dlid, 2, 75),
-            _colw(dlid, 3, 75),  _colw(dlid, 4, 60),  _colw(dlid, 5, 140),
-            _colw(dlid, 6, 95),  _colw(dlid, 7, 80),  _colw(dlid, 8, 85),
-            _colw(dlid, 9, 90),  _colw(dlid, 10, 95), _colw(dlid, 11, 115),
+            _colw(dlid, 3, 75),  _colw(dlid, 4, 75),  _colw(dlid, 5, 60),
+            _colw(dlid, 6, 140), _colw(dlid, 7, 95),  _colw(dlid, 8, 80),
+            _colw(dlid, 9, 85),  _colw(dlid, 10, 90), _colw(dlid, 11, 95),
+            _colw(dlid, 12, 115), _colw(dlid, 13, 115),
         ]
 
-    # ── Trade Log ─────────────────────────────────────────────────────────
-    if tlid is not None:
+    # ── Trade Journal (formerly Trade Log) ────────────────────────────────
+    if tjid is not None:
         rq += [
-            _cell(tlid, 0, 1, 0, 15, bg=C['navy'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
-            _rowh(tlid, 0, 28),
-            _freeze(tlid, rows=1),
-            _cell(tlid, 1, 2000, 0, 15, fg=C['dgray'], size=9),
-            _cell(tlid, 1, 2000, 13, 15, wrap='WRAP'),
-            _borders(tlid, 0, 2000, 0, 15),
-            _colw(tlid, 0, 100), _colw(tlid, 1, 65),  _colw(tlid, 2, 60),
-            _colw(tlid, 3, 75),  _colw(tlid, 4, 80),  _colw(tlid, 5, 90),
-            _colw(tlid, 6, 155), _colw(tlid, 7, 140), _colw(tlid, 8, 140),
-            _colw(tlid, 9, 140), _colw(tlid, 10, 90), _colw(tlid, 11, 75),
-            _colw(tlid, 12, 80), _colw(tlid, 13, 290), _colw(tlid, 14, 210),
+            _cell(tjid, 0, 1, 0, 15, bg=C['dkgrn'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
+            _rowh(tjid, 0, 28),
+            _freeze(tjid, rows=1),
+            _cell(tjid, 1, 2000, 0, 15, fg=C['dgray'], size=9),
+            _cell(tjid, 1, 2000, 13, 15, wrap='WRAP'),
+            _borders(tjid, 0, 2000, 0, 15, C['border']),
+            _colw(tjid, 0, 100), _colw(tjid, 1, 65),  _colw(tjid, 2, 60),
+            _colw(tjid, 3, 75),  _colw(tjid, 4, 80),  _colw(tjid, 5, 90),
+            _colw(tjid, 6, 155), _colw(tjid, 7, 140), _colw(tjid, 8, 140),
+            _colw(tjid, 9, 140), _colw(tjid, 10, 90), _colw(tjid, 11, 75),
+            _colw(tjid, 12, 80), _colw(tjid, 13, 290), _colw(tjid, 14, 210),
         ]
 
     # ── Performance ───────────────────────────────────────────────────────
     if pid is not None:
         rq += [
-            _cell(pid, 0, 1, 0, 5, bg=C['navy'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
+            _cell(pid, 0, 1, 0, 5, bg=C['dkgrn'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
             _rowh(pid, 0, 28),
             _freeze(pid, rows=1),
             _cell(pid, 1, 2000, 0, 5, fg=C['dgray'], size=9),
             _cell(pid, 1, 2000, 1, 3, align='RIGHT'),
-            _borders(pid, 0, 2000, 0, 5),
+            _borders(pid, 0, 2000, 0, 5, C['border']),
             _colw(pid, 0, 100), _colw(pid, 1, 120),
             _colw(pid, 2, 110), _colw(pid, 3, 100), _colw(pid, 4, 100),
+        ]
+
+    # ── Risk Monitor ──────────────────────────────────────────────────────
+    if rmid is not None:
+        rq += [
+            _cell(rmid, 0, 1, 0, 12, bg=C['dkgrn'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
+            _rowh(rmid, 0, 28),
+            _freeze(rmid, rows=1),
+            _cell(rmid, 1, 2000, 0, 12, fg=C['dgray'], size=9),
+            _borders(rmid, 0, 2000, 0, 12, C['border']),
+            _cond(rmid, 2, 200, 4, 5, 'TEXT_CONTAINS', '+', C['lpos'], C['pos'], True),
+            _cond(rmid, 2, 200, 4, 5, 'TEXT_CONTAINS', '-', C['lneg'], C['neg'], True),
+            _cond(rmid, 2, 200, 5, 6, 'TEXT_CONTAINS', '+', C['lpos'], C['pos'], True),
+            _cond(rmid, 2, 200, 5, 6, 'TEXT_CONTAINS', '-', C['lneg'], C['neg'], True),
+            _colw(rmid, 0, 90),  _colw(rmid, 1, 110), _colw(rmid, 2, 80),
+            _colw(rmid, 3, 80),  _colw(rmid, 4, 75),  _colw(rmid, 5, 80),
+            _colw(rmid, 6, 80),  _colw(rmid, 7, 80),  _colw(rmid, 8, 85),
+            _colw(rmid, 9, 80),  _colw(rmid, 10, 80), _colw(rmid, 11, 85),
+        ]
+        for i in range(2, 50):
+            rq.append(_cell(rmid, i, i+1, 0, 12, bg=(C['white'] if i % 2 == 0 else C['xmint'])))
+
+    # ── Market Pulse ──────────────────────────────────────────────────────
+    if mpid is not None:
+        rq += [
+            _cell(mpid, 0, 1, 0, 8, bg=C['dkgrn'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
+            _rowh(mpid, 0, 28),
+            _freeze(mpid, rows=1),
+            _cell(mpid, 1, 2000, 0, 8, fg=C['dgray'], size=9),
+            _borders(mpid, 0, 2000, 0, 8, C['border']),
+            _cond(mpid, 1, 2000, 2, 5, 'TEXT_CONTAINS', '+', C['lpos'], C['pos']),
+            _cond(mpid, 1, 2000, 2, 5, 'TEXT_CONTAINS', '-', C['lneg'], C['neg']),
+            _colw(mpid, 0, 100), _colw(mpid, 1, 70),  _colw(mpid, 2, 75),
+            _colw(mpid, 3, 75),  _colw(mpid, 4, 75),  _colw(mpid, 5, 65),
+            _colw(mpid, 6, 90),  _colw(mpid, 7, 140),
+        ]
+        for i in range(1, 500):
+            rq.append(_cell(mpid, i, i+1, 0, 8, bg=(C['white'] if i % 2 == 1 else C['xmint'])))
+
+    # ── Sector History ────────────────────────────────────────────────────
+    if shid is not None:
+        rq += [
+            _cell(shid, 0, 1, 0, 9, bg=C['dkgrn'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
+            _rowh(shid, 0, 28),
+            _freeze(shid, rows=1),
+            _cell(shid, 1, 2000, 0, 9, fg=C['dgray'], size=9),
+            _borders(shid, 0, 2000, 0, 9, C['border']),
+            _cond(shid, 1, 2000, 1, 9, 'NUMBER_GREATER_THAN_EQ', '0', C['lpos'], C['pos']),
+            _cond(shid, 1, 2000, 1, 9, 'NUMBER_LESS_THAN',        '0', C['lneg'], C['neg']),
+            _colw(shid, 0, 100),
+        ]
+        for i in range(1, 9):
+            rq.append(_colw(shid, i, 105))
+
+    # ── Closed Trades ─────────────────────────────────────────────────────
+    if ctid is not None:
+        rq += [
+            _cell(ctid, 0, 1, 0, 8, bg=C['dkgrn'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
+            _rowh(ctid, 0, 28),
+            _freeze(ctid, rows=1),
+            _cell(ctid, 1, 2000, 0, 8, fg=C['dgray'], size=9),
+            _borders(ctid, 0, 2000, 0, 8, C['border']),
+            _cond(ctid, 1, 2000, 6, 7, 'TEXT_CONTAINS', '+', C['lpos'], C['pos'], True),
+            _cond(ctid, 1, 2000, 6, 7, 'TEXT_CONTAINS', '-', C['lneg'], C['neg'], True),
+            _cond(ctid, 1, 2000, 7, 8, 'TEXT_CONTAINS', '+', C['lpos'], C['pos'], True),
+            _cond(ctid, 1, 2000, 7, 8, 'TEXT_CONTAINS', '-', C['lneg'], C['neg'], True),
+            _colw(ctid, 0, 100), _colw(ctid, 1, 70),  _colw(ctid, 2, 130),
+            _colw(ctid, 3, 85),  _colw(ctid, 4, 85),  _colw(ctid, 5, 65),
+            _colw(ctid, 6, 75),  _colw(ctid, 7, 85),
+        ]
+        for i in range(1, 500):
+            rq.append(_cell(ctid, i, i+1, 0, 8, bg=(C['white'] if i % 2 == 1 else C['xmint'])))
+
+    # ── Analytics ─────────────────────────────────────────────────────────
+    if anid is not None:
+        rq += [
+            _cell(anid, 0, 1, 0, 3, bg=C['blk'], fg=C['white'], bold=True, size=13, valign='MIDDLE'),
+            _rowh(anid, 0, 36),
+            _cell(anid, 2, 3, 0, 3, bg=C['grn'], fg=C['white'], bold=True),
+            _cell(anid, 10, 11, 0, 3, bg=C['grn'], fg=C['white'], bold=True),
+            _cell(anid, 1, 100, 0, 1, bold=True, fg=C['dgray']),
+            _cell(anid, 1, 100, 1, 2, align='RIGHT', fg=C['dgray']),
+            _colw(anid, 0, 210), _colw(anid, 1, 160),
         ]
 
     if rq:
@@ -795,7 +1119,7 @@ def apply_formatting(sh, n_pos):
         _del_charts(sh, dlid)
         try:
             sh.batch_update({'requests': [
-                _line_chart(dlid, 2, 13, 'Portfolio Equity Over Time', 0, 11, 'Total Equity ($)', w=560, h=300)
+                _line_chart(dlid, 2, 14, 'Portfolio Equity Over Time', 0, 13, 'Total Equity ($)', w=560, h=300)
             ]})
             print("Daily Log chart added.")
         except Exception as e:
@@ -828,12 +1152,16 @@ def ensure_tab(sh, title, headers):
     return ws
 
 
-def update_sheets(mode, today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
+def update_sheets(mode, today, spy_chg, qqq_chg, iwm_chg, vix, fg_score, sector_perf,
                   held, trades_done, buying_power, equity, stops_hit, targets_hit):
     sh = get_sheet()
     if not sh:
         print("Sheets not configured, skipping.")
         return
+
+    prev_equity = get_prev_equity(sh)
+    daily_pnl   = equity - prev_equity if prev_equity is not None else 0.0
+
     try:
         # ── Dashboard (full refresh every run) ────────────────────────────
         try:
@@ -844,11 +1172,16 @@ def update_sheets(mode, today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
 
         rows = [
             ['  TRADING BOT DASHBOARD'],
-            [f'  Last Updated: {today}   ·   Session: {mode.upper()}'],
+            [f'  {today}   ·   {mode.upper()}   ·   Updated: {datetime.now().strftime("%H:%M")} ET'],
+            [''],
+            ['  KEY METRICS'],
+            ['Total Equity', 'Cash', 'Daily P&L', '# Positions'],
+            [f'${equity:.2f}', f'${buying_power:.2f}', f'${daily_pnl:+.2f}', str(len(held))],
             [''],
             ['  MARKET OVERVIEW'],
             ['SPY', f'{spy_chg:+.2f}%'],
             ['QQQ', f'{qqq_chg:+.2f}%'],
+            ['IWM', f'{iwm_chg:+.2f}%'],
             ['VIX', f'{vix:.1f}'],
             ['Fear & Greed', fg_label(fg_score)],
             [''],
@@ -880,25 +1213,26 @@ def update_sheets(mode, today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
 
     try:
         # ── Daily Log (one row per run) ───────────────────────────────────
-        hdrs = ['Date','Mode','SPY%','QQQ%','VIX','Fear&Greed','# Positions',
-                '# Trades','Stops Hit','Targets Hit','Cash','Total Equity']
+        hdrs = ['Date','Mode','SPY%','QQQ%','IWM%','VIX','Fear&Greed','# Positions',
+                '# Trades','Stops Hit','Targets Hit','Daily P&L','Cash','Total Equity']
         ws = ensure_tab(sh, 'Daily Log', hdrs)
         ws.append_row([today, mode, f'{spy_chg:+.2f}%', f'{qqq_chg:+.2f}%',
-                       f'{vix:.1f}', fg_label(fg_score), len(held), len(trades_done),
+                       f'{iwm_chg:+.2f}%', f'{vix:.1f}', fg_label(fg_score),
+                       len(held), len(trades_done),
                        len(stops_hit), len(targets_hit),
-                       f'${buying_power:.2f}', f'${equity:.2f}'],
+                       f'${daily_pnl:+.2f}', f'${buying_power:.2f}', f'${equity:.2f}'],
                       value_input_option='RAW')
         print("Daily log appended.")
     except Exception as e:
         print(f"Daily log error: {e}")
 
     try:
-        # ── Trade Log (one row per trade) ─────────────────────────────────
+        # ── Trade Journal (one row per trade) ─────────────────────────────
         if trades_done:
             hdrs = ['Date','Symbol','Action','Price','Amount','Conviction',
                     'Fundamental','Macro','Technical','Innovation','EV',
                     'Stop','Target','Final Thesis','Primary Risk']
-            ws = ensure_tab(sh, 'Trade Log', hdrs)
+            ws = ensure_tab(sh, 'Trade Journal', hdrs)
             for t in trades_done:
                 c = t['committee']
                 ws.append_row([
@@ -912,9 +1246,9 @@ def update_sheets(mode, today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
                     f"${t['stop']:.2f}", f"${t['target']:.2f}",
                     c.get('final_thesis',''), c.get('primary_risk','')
                 ], value_input_option='USER_ENTERED')
-            print(f"Trade log: {len(trades_done)} trades logged.")
+            print(f"Trade journal: {len(trades_done)} trades logged.")
     except Exception as e:
-        print(f"Trade log error: {e}")
+        print(f"Trade journal error: {e}")
 
     try:
         # ── Performance (daily equity tracking) ───────────────────────────
@@ -926,6 +1260,13 @@ def update_sheets(mode, today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
         print("Performance log appended.")
     except Exception as e:
         print(f"Performance log error: {e}")
+
+    update_risk_monitor(sh, today, held, equity)
+    update_market_pulse(sh, today, mode, spy_chg, qqq_chg, iwm_chg, vix, fg_score)
+    update_sector_history(sh, today, sector_perf)
+    if stops_hit or targets_hit:
+        update_closed_trades(sh, today, stops_hit, targets_hit)
+    update_analytics(sh, today)
 
     apply_formatting(sh, len(held))
 
@@ -1043,11 +1384,13 @@ def main():
     # Get market data first
     spy_data = get_stock_data('SPY')
     qqq_data = get_stock_data('QQQ')
+    iwm_data = get_stock_data('IWM')
     vix_data = get_stock_data('^VIX')
     spy_chg  = spy_data['day_chg'] if spy_data else 0.0
     qqq_chg  = qqq_data['day_chg'] if qqq_data else 0.0
+    iwm_chg  = iwm_data['day_chg'] if iwm_data else 0.0
     vix      = vix_data['price']   if vix_data else 20.0
-    print(f"Market: SPY {spy_chg:+.2f}% QQQ {qqq_chg:+.2f}% VIX {vix:.1f}")
+    print(f"Market: SPY {spy_chg:+.2f}% QQQ {qqq_chg:+.2f}% IWM {iwm_chg:+.2f}% VIX {vix:.1f}")
 
     # Sector rotation
     print("Fetching sector data...")
@@ -1093,7 +1436,7 @@ def main():
             lines.append('\n*Stops executed:*')
             for s in stops_hit:
                 lines.append(f"  ⚠️ {s['symbol']} @ ${s['price']:.2f} | P&L: {s['pnl']:+.1f}% ({s['type']})")
-        update_sheets('eod', today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
+        update_sheets('eod', today, spy_chg, qqq_chg, iwm_chg, vix, fg_score, sector_perf,
                       held, [], buying_power, equity, stops_hit, targets_hit)
         eod_lines = [f"{SLACK_MENTION} 📊 *EOD Recap ready — {today}* | <{SHEET_URL}|Open Dashboard>"]
         if targets_hit:
@@ -1256,7 +1599,7 @@ def main():
     lines.append('_Override: sell directly in Robinhood app_')
 
     # Write everything to Google Sheets
-    update_sheets(mode, today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
+    update_sheets(mode, today, spy_chg, qqq_chg, iwm_chg, vix, fg_score, sector_perf,
                   held, trades_done, buying_power, equity, stops_hit, targets_hit)
 
     # Slack — minimal ping with link + any critical alerts
