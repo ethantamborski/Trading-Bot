@@ -43,9 +43,9 @@ CANDIDATES = list(dict.fromkeys([
     # Mega-cap tech
     'META','GOOGL','MSFT','AAPL','AMZN','TSLA','NFLX',
     # Fintech / crypto
-    'COIN','MSTR','MARA','HOOD','SOFI','AFRM','UPST','SQ',
+    'COIN','MSTR','MARA','HOOD','SOFI','AFRM','UPST',
     # Consumer / social
-    'SHOP','RBLX','RDDT','PINS','SNAP','TTD','ROKU','UBER',
+    'SHOP','RBLX','RDDT','PINS','SNAP','TTD','ROKU','UBER','XYZ',
     # Health / consumer growth
     'HIMS','CELH','DUOL',
     # Other
@@ -425,12 +425,14 @@ RESPOND IN THIS EXACT JSON — no markdown, no commentary outside the JSON:
     try:
         resp = ai_client.messages.create(
             model='claude-sonnet-4-6',
-            max_tokens=1100,
+            max_tokens=2000,
             messages=[{'role': 'user', 'content': prompt}]
         )
         text = resp.content[0].text.strip()
         if text.startswith('```'):
             text = text.split('\n', 1)[1].rsplit('```', 1)[0].strip()
+        import re as _re
+        text = _re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]', ' ', text)
         result = json.loads(text)
         result['earnings_days'] = dte
         return result
@@ -495,7 +497,7 @@ def load_positions(buying_power):
                     buying_power += qty * price
                     continue
 
-            held[sym] = {'qty': qty, 'cost': cost, 'price': price, 'pnl': pnl, 'stop': stop}
+            held[sym] = {'qty': qty, 'cost': cost, 'price': price if price > 0 else cost, 'pnl': pnl, 'stop': stop}
         except Exception as e:
             print(f"  Position error: {e}")
 
