@@ -858,10 +858,11 @@ def update_sheets(mode, today, spy_chg, qqq_chg, vix, fg_score, sector_perf,
         rows.append([''])
         rows.append(['  OPEN POSITIONS', 'Entry', 'Current', 'P&L %', 'P&L $', 'Stop', 'To Stop', 'Target', 'To Target'])
         for sym, h in held.items():
-            dpnl   = (h['price'] - h['cost']) * h['qty']
-            tostop = (h['price'] - h['stop']) / h['price'] * 100
-            totgt  = (h['cost'] * 1.20 - h['price']) / h['price'] * 100
-            rows.append([sym, f"${h['cost']:.2f}", f"${h['price']:.2f}",
+            px     = h['price'] if h['price'] > 0 else h['cost']
+            dpnl   = (px - h['cost']) * h['qty']
+            tostop = (px - h['stop']) / px * 100
+            totgt  = (h['cost'] * 1.20 - px) / px * 100
+            rows.append([sym, f"${h['cost']:.2f}", f"${px:.2f}",
                          f"{h['pnl']:+.1f}%", f"${dpnl:+.2f}",
                          f"${h['stop']:.2f}", f"{tostop:.1f}%",
                          f"${h['cost']*1.20:.2f}", f"{totgt:.1f}%"])
