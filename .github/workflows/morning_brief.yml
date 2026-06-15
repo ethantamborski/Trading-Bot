@@ -2,9 +2,11 @@ name: Morning Trading Brief
 
 on:
   schedule:
-    # 9am EDT (UTC-4) every weekday — adjust to '0 14 * * 1-5' in winter (EST)
-    - cron: '0 13 * * 1-5'
+    # 8:30am EDT (UTC-4) every weekday — GitHub delays ~30min so fires ~9am ET
+    - cron: '30 12 * * 1-5'
   workflow_dispatch:
+  repository_dispatch:
+    types: [morning_brief]
     inputs:
       mode:
         description: 'morning or eod'
