@@ -1232,15 +1232,20 @@ def get_sheet():
 
 
 def ensure_tab(sh, title, headers):
-    """Get or create a tab. If headers changed, clear and reset so columns stay aligned."""
+    """Get or create a tab. If headers changed, clear and reset. Always ensure enough columns."""
+    needed_cols = len(headers) + 6
     try:
         ws = sh.worksheet(title)
         current = ws.row_values(1)
         if current != headers:
             ws.clear()
+            if ws.col_count < needed_cols:
+                ws.resize(rows=2000, cols=needed_cols)
             ws.append_row(headers, value_input_option='USER_ENTERED')
+        elif ws.col_count < needed_cols:
+            ws.resize(rows=2000, cols=needed_cols)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows=2000, cols=len(headers)+4)
+        ws = sh.add_worksheet(title=title, rows=2000, cols=needed_cols)
         ws.append_row(headers, value_input_option='USER_ENTERED')
     return ws
 
