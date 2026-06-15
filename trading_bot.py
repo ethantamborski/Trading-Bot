@@ -618,6 +618,18 @@ def _del_charts(sh, sheet_id):
 
 
 def _line_chart(sid, anchor_row, anchor_col, title, x_col, y_col, y_label, w=620, h=320):
+    """Single-series line chart."""
+    return _multi_line_chart(sid, anchor_row, anchor_col, title, x_col,
+                             [y_col], [y_label], w, h)
+
+
+def _multi_line_chart(sid, anchor_row, anchor_col, title, x_col, y_cols, y_labels, w=680, h=340):
+    """Multi-series line chart."""
+    series = [
+        {'series': {'sourceRange': {'sources': [_rng(sid, 0, 2000, c, c+1)]}},
+         'targetAxis': 'LEFT_AXIS'}
+        for c in y_cols
+    ]
     return {'addChart': {'chart': {
         'spec': {
             'title': title,
@@ -627,11 +639,10 @@ def _line_chart(sid, anchor_row, anchor_col, title, x_col, y_col, y_label, w=620
                 'legendPosition': 'BOTTOM_LEGEND',
                 'axis': [
                     {'position': 'BOTTOM_AXIS', 'title': 'Date'},
-                    {'position': 'LEFT_AXIS',   'title': y_label},
+                    {'position': 'LEFT_AXIS',   'title': y_labels[0] if len(y_labels) == 1 else ''},
                 ],
                 'domains': [{'domain': {'sourceRange': {'sources': [_rng(sid, 0, 2000, x_col, x_col+1)]}}}],
-                'series': [{'series': {'sourceRange': {'sources': [_rng(sid, 0, 2000, y_col, y_col+1)]}},
-                            'targetAxis': 'LEFT_AXIS'}],
+                'series': series,
                 'headerCount': 1,
                 'lineSmoothing': True,
             },
@@ -645,12 +656,42 @@ def _line_chart(sid, anchor_row, anchor_col, title, x_col, y_col, y_label, w=620
     }}}
 
 
-def get_prev_equity(sh):
+def _bar_chart(sid, anchor_row, anchor_col, title, x_col, y_col, w=600, h=300):
+    """Horizontal bar chart (symbol vs value)."""
+    return {'addChart': {'chart': {
+        'spec': {
+            'title': title,
+            'titleTextFormat': {'bold': True, 'fontSize': 11, 'fontFamily': 'Arial'},
+            'basicChart': {
+                'chartType': 'BAR',
+                'legendPosition': 'NO_LEGEND',
+                'axis': [
+                    {'position': 'BOTTOM_AXIS', 'title': 'P&L ($)'},
+                    {'position': 'LEFT_AXIS',   'title': 'Trade'},
+                ],
+                'domains': [{'domain': {'sourceRange': {'sources': [_rng(sid, 0, 2000, x_col, x_col+1)]}}}],
+                'series': [{'series': {'sourceRange': {'sources': [_rng(sid, 0, 2000, y_col, y_col+1)]}},
+                            'targetAxis': 'BOTTOM_AXIS'}],
+                'headerCount': 1,
+            },
+            'fontName': 'Arial',
+            'backgroundColor': _rgb('#FFFFFF'),
+        },
+        'position': {'overlayPosition': {
+            'anchorCell': {'sheetId': sid, 'rowIndex': anchor_row, 'columnIndex': anchor_col},
+            'widthPixels': w, 'heightPixels': h
+        }}
+    }}}
+
+
+def get_prev_equity(sh, today):
+    """Return the most recent equity value from a PREVIOUS day (not today)."""
     try:
-        ws = sh.worksheet('Performance')
+        ws   = sh.worksheet('Performance')
         vals = ws.get_all_values()
-        if len(vals) > 1:
-            return float(vals[-1][1])
+        for row in reversed(vals[1:]):
+            if len(row) >= 2 and row[0] != today:
+                return float(row[1])
     except Exception:
         pass
     return None
@@ -726,9 +767,11 @@ def update_market_pulse(sh, today, mode, spy_chg, qqq_chg, iwm_chg, vix, fg_scor
     try:
         hdrs = ['Date','Mode','SPY %','QQQ %','IWM %','VIX','F&G Score','F&G Label']
         ws = ensure_tab(sh, 'Market Pulse', hdrs)
-        ws.append_row([today, mode, f'{spy_chg:+.2f}%', f'{qqq_chg:+.2f}%',
-                       f'{iwm_chg:+.2f}%', f'{vix:.1f}', fg_score, fg_label(fg_score)],
-                      value_input_option='RAW')
+        # Store % and VIX as raw numbers so Sheets can chart them
+        ws.append_row([today, mode,
+                       round(spy_chg, 2), round(qqq_chg, 2), round(iwm_chg, 2),
+                       round(vix, 1), fg_score, fg_label(fg_score)],
+                      value_input_option='USER_ENTERED')
         print("Market Pulse appended.")
     except Exception as e:
         print(f"Market Pulse error: {e}")
@@ -1108,12 +1151,12 @@ def apply_formatting(sh, n_pos):
         except Exception as e:
             print(f"Formatting batch error: {e}")
 
-    # ── Charts ────────────────────────────────────────────────────────────
+    # ── Charts (one batch_update per tab to isolate failures) ────────────────
     if pid is not None:
         _del_charts(sh, pid)
         try:
             sh.batch_update({'requests': [
-                _line_chart(pid, 2, 6, 'Portfolio Equity Curve', 0, 1, 'Total Equity ($)', w=650, h=360)
+                _line_chart(pid, 2, 6, 'Portfolio Equity Curve', 0, 1, 'Total Equity ($)', w=660, h=360),
             ]})
             print("Performance chart added.")
         except Exception as e:
@@ -1123,11 +1166,52 @@ def apply_formatting(sh, n_pos):
         _del_charts(sh, dlid)
         try:
             sh.batch_update({'requests': [
-                _line_chart(dlid, 2, 10, 'Portfolio Equity Over Time', 0, 13, 'Total Equity ($)', w=560, h=300)
+                _line_chart(dlid, 2, 15, 'Portfolio Equity Over Time', 0, 13, 'Total Equity ($)', w=580, h=300),
             ]})
             print("Daily Log chart added.")
         except Exception as e:
-            print(f"Daily log chart error: {e}")
+            print(f"Daily Log chart error: {e}")
+
+    if mpid is not None:
+        _del_charts(sh, mpid)
+        try:
+            sh.batch_update({'requests': [
+                _multi_line_chart(mpid, 2, 9,
+                    'Market Performance — SPY / QQQ / IWM', 0, [2, 3, 4],
+                    ['SPY %', 'QQQ %', 'IWM %'], w=660, h=310),
+                _line_chart(mpid, 22, 9,
+                    'VIX — Volatility Index', 0, 5, 'VIX', w=660, h=230),
+                _line_chart(mpid, 38, 9,
+                    'Fear & Greed Index', 0, 6, 'Score (0–100)', w=660, h=230),
+            ]})
+            print("Market Pulse charts added.")
+        except Exception as e:
+            print(f"Market Pulse chart error: {e}")
+
+    if shid is not None:
+        _del_charts(sh, shid)
+        try:
+            sh.batch_update({'requests': [
+                _multi_line_chart(shid, 2, 10,
+                    'Sector Rotation — Daily Change (%)', 0,
+                    [1, 2, 3, 4, 5, 6, 7, 8],
+                    ['Technology', 'Healthcare', 'Financials', 'Energy',
+                     'Consumer Disc', 'Industrials', 'Communication', 'Materials'],
+                    w=760, h=420),
+            ]})
+            print("Sector History chart added.")
+        except Exception as e:
+            print(f"Sector History chart error: {e}")
+
+    if ctid is not None:
+        _del_charts(sh, ctid)
+        try:
+            sh.batch_update({'requests': [
+                _bar_chart(ctid, 2, 9, 'P&L Per Trade ($)', 1, 7, w=600, h=320),
+            ]})
+            print("Closed Trades chart added.")
+        except Exception as e:
+            print(f"Closed Trades chart error: {e}")
 
 
 # ── Slack ─────────────────────────────────────────────────────────────────
@@ -1148,10 +1232,15 @@ def get_sheet():
 
 
 def ensure_tab(sh, title, headers):
+    """Get or create a tab. If headers changed, clear and reset so columns stay aligned."""
     try:
         ws = sh.worksheet(title)
+        current = ws.row_values(1)
+        if current != headers:
+            ws.clear()
+            ws.append_row(headers, value_input_option='USER_ENTERED')
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows=2000, cols=len(headers)+2)
+        ws = sh.add_worksheet(title=title, rows=2000, cols=len(headers)+4)
         ws.append_row(headers, value_input_option='USER_ENTERED')
     return ws
 
@@ -1163,7 +1252,7 @@ def update_sheets(mode, today, spy_chg, qqq_chg, iwm_chg, vix, fg_score, sector_
         print("Sheets not configured, skipping.")
         return
 
-    prev_equity = get_prev_equity(sh)
+    prev_equity = get_prev_equity(sh, today)
     daily_pnl   = equity - prev_equity if prev_equity is not None else 0.0
 
     try:
