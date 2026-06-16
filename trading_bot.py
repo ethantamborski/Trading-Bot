@@ -6,7 +6,7 @@ trailing stops + take-profit + Fear & Greed + MACD + Bollinger + ATR.
 Pass 'morning' or 'eod' as sys.argv[1] (default: morning).
 """
 
-import os, json, sys, time
+import os, json, sys, time, math
 from datetime import date, datetime
 
 import robin_stocks.robinhood as r
@@ -155,10 +155,13 @@ def get_stock_data(symbol):
         hist   = ticker.history(period='3mo')
         if hist.empty or len(hist) < 20:
             return None
+        hist      = hist.dropna(subset=['Close'])
         closes    = list(hist['Close'])
-        volumes   = list(hist['Volume'])
-        price     = closes[-1]
-        prev      = closes[-2]
+        volumes   = list(hist['Volume'].fillna(0))
+        price     = float(closes[-1])
+        prev      = float(closes[-2])
+        if prev <= 0 or math.isnan(price) or math.isnan(prev):
+            return None
         n50       = min(50, len(closes))
         ma20      = sum(closes[-20:]) / 20
         ma50      = sum(closes[-n50:]) / n50
@@ -1318,7 +1321,7 @@ def update_sheets(mode, today, spy_chg, qqq_chg, iwm_chg, vix, fg_score, sector_
                        f'{iwm_chg:+.2f}%', f'{vix:.1f}', fg_label(fg_score),
                        len(held), len(trades_done),
                        len(stops_hit), len(targets_hit),
-                       f'${daily_pnl:+.2f}', f'${buying_power:.2f}', f'${equity:.2f}'],
+                       round(daily_pnl, 2), round(buying_power, 2), round(equity, 2)],
                       value_input_option='RAW')
         print("Daily log appended.")
     except Exception as e:
@@ -1564,17 +1567,17 @@ def main():
 
     qualified = sorted(
         [(sym, d) for sym, d in stock_data.items()
-         if d['day_chg'] > spy_chg and vcp_score(d, spy_chg) >= 4],
+         if d['day_chg'] > spy_chg and vcp_score(d, spy_chg) >= 3],
         key=lambda x: x[1]['day_chg'] - spy_chg,
         reverse=True,
     )
-    print(f"{len(qualified)} passed screen. Running full committee on top {min(6, len(qualified))}...")
+    print(f"{len(qualified)} passed screen. Running full committee on top {min(10, len(qualified))}...")
 
     trades_done = []
     skipped     = []
 
     if not vix_block and deployable >= 10:
-        for sym, data in qualified[:6]:
+        for sym, data in qualified[:10]:
             print(f"  Deep data + committee: {sym}...")
             deep      = get_deep_data(sym, data['price'])
             committee = run_committee(sym, data, deep, spy_chg, qqq_chg, vix,
@@ -1593,8 +1596,8 @@ def main():
                 skipped.append({'symbol': sym, 'conviction': conviction, 'reason': f'earnings in {dte} days', 'rs': rs})
                 continue
 
-            if conviction >= 8 and action == 'BUY' and deployable >= 10:
-                base_pct = {8: 0.15, 9: 0.175, 10: 0.20}.get(min(conviction, 10), 0.15)
+            if conviction >= 7 and action == 'BUY' and deployable >= 10:
+                base_pct = {7: 0.125, 8: 0.15, 9: 0.175, 10: 0.20}.get(min(conviction, 10), 0.125)
                 if vix_reduce:
                     base_pct *= 0.70
                 if dte is not None and dte <= 5:
@@ -1626,7 +1629,7 @@ def main():
                     skipped.append({'symbol': sym, 'conviction': conviction, 'reason': f'order error: {e}', 'rs': rs})
             else:
                 skipped.append({'symbol': sym, 'conviction': conviction,
-                                'reason': f'conviction {conviction}/10 — below 8/10 threshold', 'rs': rs})
+                                'reason': f'conviction {conviction}/10 — below 7/10 threshold', 'rs': rs})
 
     # ── Slack message ─────────────────────────────────────────────────────
     lines = [f"{SLACK_MENTION} 📈 *Morning Brief — {today}*\n"]
