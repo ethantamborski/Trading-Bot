@@ -346,7 +346,16 @@ def run_committee(symbol, data, deep, spy_chg, qqq_chg, vix, fg_score,
                 'RISK-ON'        if spy_chg > 0.3 and vix < 22 else
                 'RISK-OFF'       if spy_chg < -0.5 or vix > 28 else 'NEUTRAL/MIXED')
 
-    prompt = f"""You are a six-member institutional investment committee analyzing a real swing trade with real money at stake. Operate with full rigor — as if billions of dollars are at risk. Prioritize truth and probability accuracy. Genuine disagreement between members is required where warranted. Do not reach false consensus.
+    prompt = f"""You are a six-member investment committee analyzing an aggressive swing trade. Prioritize truth and probability accuracy. Genuine disagreement is required where warranted. Do not reach false consensus.
+
+CONVICTION SCALE — use this calibration exactly:
+  3-4: Poor setup. Multiple red flags, weak technicals, macro headwind. Clear SKIP.
+  5-6: Below average. Some merit but risk/reward insufficient for this account. SKIP.
+  7:   Good setup. Clean technicals, positive EV, at least one strong catalyst. BUY with standard sizing.
+  8:   Strong setup. Multiple tailwinds aligning, clear breakout structure, above-average RS. BUY with larger sizing.
+  9:   Exceptional. Everything lines up — catalyst, technicals, macro, volume. Rare. BUY aggressively.
+  10:  Generational entry. Reserved for extraordinary setups only.
+A legitimate BUY with 12% stop and 20% target on an aggressive account SHOULD score 7+. Do not anchor to institutional caution — this is an aggressive swing trading account.
 
 ══════════════════════════════════════
 MARKET ENVIRONMENT
@@ -1565,12 +1574,15 @@ def main():
             stock_data[sym] = d
         time.sleep(0.2)
 
+    market_up = spy_chg > 0
     qualified = sorted(
         [(sym, d) for sym, d in stock_data.items()
-         if d['day_chg'] > spy_chg and vcp_score(d, spy_chg) >= 3],
+         if market_up and d['day_chg'] > spy_chg and vcp_score(d, spy_chg) >= 3],
         key=lambda x: x[1]['day_chg'] - spy_chg,
         reverse=True,
     )
+    if not market_up:
+        print(f"Market down (SPY {spy_chg:+.2f}%) — skipping buy screen.")
     print(f"{len(qualified)} passed screen. Running full committee on top {min(10, len(qualified))}...")
 
     trades_done = []
@@ -1684,7 +1696,9 @@ def main():
             lines.append(build_trade_report(t))
             lines.append('')
     elif vix_block:
-        lines.append('*No trades — VIX above 40.*')
+        lines.append('*No trades — VIX above 40 (extreme fear, sitting out).*')
+    elif not market_up:
+        lines.append(f'*No trades — market down (SPY {spy_chg:+.2f}%). Waiting for a green day.*')
     elif deployable < 10:
         lines.append('*No trades — buying power below minimum.*')
     else:
