@@ -36,6 +36,10 @@ TRAIL_BREAKEVEN_AT    = 0.08   # trail stop to +0.5% when up 8%
 TRAIL_PROFIT_AT       = 0.15   # trail stop to +5% when up 15%
 TAKE_PROFIT_AT        = 0.20   # full auto-sell when up 20%
 
+MIN_CONVICTION        = 6      # hard floor — never buy below this
+ROTATE_INTO_CONVICTION = 8     # only rotate capital into 8/10+ ideas
+ROTATE_LAGGARD_MAX_PNL = 3.0   # only rotate OUT of positions flat/red (< +3%)
+
 # 55-stock high-momentum universe
 CANDIDATES = list(dict.fromkeys([
     # AI / semiconductors
@@ -1606,7 +1610,7 @@ def main():
                 skipped.append({'symbol': sym, 'conviction': conviction, 'reason': f'earnings in {dte} days', 'rs': rs})
                 continue
 
-            if conviction >= 6 and action == 'BUY' and deployable >= 10:
+            if conviction >= MIN_CONVICTION and action == 'BUY' and deployable >= 10:
                 base_pct = {6: 0.25, 7: 0.30, 8: 0.35, 9: 0.40, 10: 0.45}.get(min(conviction, 10), 0.25)
                 if vix_reduce:
                     base_pct *= 0.70
@@ -1639,43 +1643,59 @@ def main():
                     skipped.append({'symbol': sym, 'conviction': conviction, 'reason': f'order error: {e}', 'rs': rs, 'action': action, 'data': data, 'committee': committee})
             else:
                 skipped.append({'symbol': sym, 'conviction': conviction,
-                                'reason': f'conviction {conviction}/10 — below 6/10 threshold', 'rs': rs, 'action': action, 'data': data, 'committee': committee})
+                                'reason': f'conviction {conviction}/10 — below {MIN_CONVICTION}/10 threshold', 'rs': rs, 'action': action, 'data': data, 'committee': committee})
 
-    # ── Force-deploy: if no trades placed and cash sitting, take best BUY candidate ──
-    if not trades_done and not vix_block and deployable >= 20:
-        best_picks = sorted(
-            [x for x in skipped if x.get('action') == 'BUY' and x.get('conviction', 0) >= 5 and 'data' in x],
+    # ── Capital rotation: sell a flat/red laggard to fund a strong unfunded pick ──
+    rotated_out = []
+    if not vix_block and held:
+        strong_unfunded = sorted(
+            [x for x in skipped
+             if x.get('action') == 'BUY' and x.get('conviction', 0) >= ROTATE_INTO_CONVICTION
+             and 'data' in x and x['symbol'] not in {t['symbol'] for t in trades_done}],
             key=lambda x: x['conviction'], reverse=True
         )
-        if best_picks:
-            pick = best_picks[0]
-            sym  = pick['symbol']
-            data = pick['data']
-            committee = pick['committee']
-            dollar_amt = round(min(buying_power * 0.25, deployable, equity * 0.25), 2)
-            if dollar_amt >= 1:
+        if strong_unfunded:
+            laggard_sym, laggard = min(held.items(), key=lambda kv: kv[1]['pnl'])
+            pick = strong_unfunded[0]
+            # only rotate out a position that is flat/red (not a winner we're letting run)
+            if laggard['pnl'] < ROTATE_LAGGARD_MAX_PNL:
                 try:
-                    r.orders.order_buy_fractional_by_price(
-                        sym, dollar_amt, account_number=ACCOUNT_NUMBER, jsonify=True
-                    )
-                    rs  = data['day_chg'] - spy_chg
-                    dte = pick.get('earnings_days')
-                    trades_done.append({
-                        'symbol':        sym,
-                        'amount':        dollar_amt,
-                        'price':         data['price'],
-                        'conviction':    pick['conviction'],
-                        'stop':          round(data['price'] * (1 - STOP_PCT), 2),
-                        'target':        round(data['price'] * 1.20, 2),
-                        'rs':            rs,
-                        'committee':     committee,
-                        'earnings_days': dte,
-                    })
-                    deployable   -= dollar_amt
-                    buying_power -= dollar_amt
-                    print(f"  ✓ Force-deployed best pick: {sym} ({pick['conviction']}/10) ${dollar_amt:.2f}")
+                    r.orders.order_sell_market(laggard_sym, laggard['qty'],
+                                               account_number=ACCOUNT_NUMBER, jsonify=True)
+                    proceeds = laggard['qty'] * laggard['price']
+                    buying_power += proceeds
+                    deployable   += proceeds
+                    rotated_out.append({'symbol': laggard_sym, 'pnl': laggard['pnl'],
+                                        'proceeds': proceeds, 'into': pick['symbol'],
+                                        'conviction': pick['conviction']})
+                    del held[laggard_sym]
+                    print(f"  ↻ ROTATE: sold {laggard_sym} ({laggard['pnl']:+.1f}%) → funding {pick['symbol']} ({pick['conviction']}/10)")
+
+                    sym  = pick['symbol']
+                    data = pick['data']
+                    dollar_amt = round(min(buying_power * 0.30, deployable, equity * 0.30), 2)
+                    if dollar_amt >= 1:
+                        r.orders.order_buy_fractional_by_price(
+                            sym, dollar_amt, account_number=ACCOUNT_NUMBER, jsonify=True
+                        )
+                        rs  = data['day_chg'] - spy_chg
+                        dte = pick.get('earnings_days')
+                        trades_done.append({
+                            'symbol':        sym,
+                            'amount':        dollar_amt,
+                            'price':         data['price'],
+                            'conviction':    pick['conviction'],
+                            'stop':          round(data['price'] * (1 - STOP_PCT), 2),
+                            'target':        round(data['price'] * 1.20, 2),
+                            'rs':            rs,
+                            'committee':     pick['committee'],
+                            'earnings_days': dte,
+                        })
+                        deployable   -= dollar_amt
+                        buying_power -= dollar_amt
+                        print(f"  ✓ Rotated into {sym} ${dollar_amt:.2f}")
                 except Exception as e:
-                    print(f"  Force-deploy failed {sym}: {e}")
+                    print(f"  Rotation failed: {e}")
 
     # ── Slack message ─────────────────────────────────────────────────────
     lines = [f"{SLACK_MENTION} 📈 *Morning Brief — {today}*\n"]
@@ -1724,6 +1744,10 @@ def main():
             )
         lines.append('')
 
+    if rotated_out:
+        for ro in rotated_out:
+            lines.append(f"↻ *Rotated:* sold {ro['symbol']} ({ro['pnl']:+.1f}%) → into {ro['into']} ({ro['conviction']}/10)\n")
+
     if trades_done:
         lines.append(f'*Committee bought {len(trades_done)} position(s) today:*\n')
         for t in trades_done:
@@ -1735,7 +1759,7 @@ def main():
         lines.append('*No trades — buying power below minimum.*')
     else:
         lines.append('*No trades — nothing cleared the full committee today.*')
-        near = sorted([x for x in skipped if x['conviction'] >= 6],
+        near = sorted([x for x in skipped if x['conviction'] >= 5],
                       key=lambda x: x['conviction'], reverse=True)[:4]
         if near:
             lines.append('Near misses (reviewed but not cleared):')
