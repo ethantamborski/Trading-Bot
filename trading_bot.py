@@ -31,7 +31,7 @@ ACCOUNT_NUMBER = '456166776'
 SLACK_MENTION  = '<@U0B8ZNEB9N2>'
 STOP_PCT       = 0.12
 
-CASH_RESERVE          = 0.20
+CASH_RESERVE          = 0.10
 TRAIL_BREAKEVEN_AT    = 0.08   # trail stop to +0.5% when up 8%
 TRAIL_PROFIT_AT       = 0.15   # trail stop to +5% when up 15%
 TAKE_PROFIT_AT        = 0.20   # full auto-sell when up 20%
@@ -1510,7 +1510,7 @@ def main():
 
     # Positions with full exit management
     held, stops_hit, targets_hit, trailing_log, buying_power = load_positions(buying_power)
-    deployable  = buying_power * (1 - 0.20)
+    deployable  = buying_power * (1 - CASH_RESERVE)
     equity      = buying_power + sum(h['price'] * h['qty'] for h in held.values())
     print(f"Cash: ${buying_power:.2f} | Deployable: ${deployable:.2f} | Equity: ${equity:.2f}")
 
@@ -1577,13 +1577,11 @@ def main():
     market_up = spy_chg > 0
     qualified = sorted(
         [(sym, d) for sym, d in stock_data.items()
-         if market_up and d['day_chg'] > spy_chg and vcp_score(d, spy_chg) >= 3],
+         if d['day_chg'] > spy_chg and vcp_score(d, spy_chg) >= 2],
         key=lambda x: x[1]['day_chg'] - spy_chg,
         reverse=True,
     )
-    if not market_up:
-        print(f"Market down (SPY {spy_chg:+.2f}%) — skipping buy screen.")
-    print(f"{len(qualified)} passed screen. Running full committee on top {min(10, len(qualified))}...")
+    print(f"{len(qualified)} passed screen (SPY {spy_chg:+.2f}%). Running full committee on top {min(10, len(qualified))}...")
 
     trades_done = []
     skipped     = []
@@ -1608,15 +1606,15 @@ def main():
                 skipped.append({'symbol': sym, 'conviction': conviction, 'reason': f'earnings in {dte} days', 'rs': rs})
                 continue
 
-            if conviction >= 7 and action == 'BUY' and deployable >= 10:
-                base_pct = {7: 0.125, 8: 0.15, 9: 0.175, 10: 0.20}.get(min(conviction, 10), 0.125)
+            if conviction >= 6 and action == 'BUY' and deployable >= 10:
+                base_pct = {6: 0.25, 7: 0.30, 8: 0.35, 9: 0.40, 10: 0.45}.get(min(conviction, 10), 0.25)
                 if vix_reduce:
                     base_pct *= 0.70
                 if dte is not None and dte <= 5:
                     base_pct *= 0.50
-                dollar_amt = round(min(buying_power * base_pct, deployable, equity * 0.25), 2)
-                if dollar_amt < 5:
-                    skipped.append({'symbol': sym, 'conviction': conviction, 'reason': f'insufficient funds', 'rs': rs})
+                dollar_amt = round(min(buying_power * base_pct, deployable, equity * 0.30), 2)
+                if dollar_amt < 1:
+                    skipped.append({'symbol': sym, 'conviction': conviction, 'reason': f'insufficient funds', 'rs': rs, 'action': action, 'data': data, 'committee': committee})
                     continue
                 try:
                     r.orders.order_buy_fractional_by_price(
@@ -1638,10 +1636,46 @@ def main():
                     print(f"  ✓ Bought {sym} ${dollar_amt:.2f}")
                 except Exception as e:
                     print(f"  Order failed {sym}: {e}")
-                    skipped.append({'symbol': sym, 'conviction': conviction, 'reason': f'order error: {e}', 'rs': rs})
+                    skipped.append({'symbol': sym, 'conviction': conviction, 'reason': f'order error: {e}', 'rs': rs, 'action': action, 'data': data, 'committee': committee})
             else:
                 skipped.append({'symbol': sym, 'conviction': conviction,
-                                'reason': f'conviction {conviction}/10 — below 7/10 threshold', 'rs': rs})
+                                'reason': f'conviction {conviction}/10 — below 6/10 threshold', 'rs': rs, 'action': action, 'data': data, 'committee': committee})
+
+    # ── Force-deploy: if no trades placed and cash sitting, take best BUY candidate ──
+    if not trades_done and not vix_block and deployable >= 20:
+        best_picks = sorted(
+            [x for x in skipped if x.get('action') == 'BUY' and x.get('conviction', 0) >= 5 and 'data' in x],
+            key=lambda x: x['conviction'], reverse=True
+        )
+        if best_picks:
+            pick = best_picks[0]
+            sym  = pick['symbol']
+            data = pick['data']
+            committee = pick['committee']
+            dollar_amt = round(min(buying_power * 0.25, deployable, equity * 0.25), 2)
+            if dollar_amt >= 1:
+                try:
+                    r.orders.order_buy_fractional_by_price(
+                        sym, dollar_amt, account_number=ACCOUNT_NUMBER, jsonify=True
+                    )
+                    rs  = data['day_chg'] - spy_chg
+                    dte = pick.get('earnings_days')
+                    trades_done.append({
+                        'symbol':        sym,
+                        'amount':        dollar_amt,
+                        'price':         data['price'],
+                        'conviction':    pick['conviction'],
+                        'stop':          round(data['price'] * (1 - STOP_PCT), 2),
+                        'target':        round(data['price'] * 1.20, 2),
+                        'rs':            rs,
+                        'committee':     committee,
+                        'earnings_days': dte,
+                    })
+                    deployable   -= dollar_amt
+                    buying_power -= dollar_amt
+                    print(f"  ✓ Force-deployed best pick: {sym} ({pick['conviction']}/10) ${dollar_amt:.2f}")
+                except Exception as e:
+                    print(f"  Force-deploy failed {sym}: {e}")
 
     # ── Slack message ─────────────────────────────────────────────────────
     lines = [f"{SLACK_MENTION} 📈 *Morning Brief — {today}*\n"]
@@ -1697,8 +1731,6 @@ def main():
             lines.append('')
     elif vix_block:
         lines.append('*No trades — VIX above 40 (extreme fear, sitting out).*')
-    elif not market_up:
-        lines.append(f'*No trades — market down (SPY {spy_chg:+.2f}%). Waiting for a green day.*')
     elif deployable < 10:
         lines.append('*No trades — buying power below minimum.*')
     else:
