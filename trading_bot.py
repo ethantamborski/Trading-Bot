@@ -3,7 +3,8 @@
 Autonomous trading bot — full institutional-grade analysis.
 6-member committee + live news + options sentiment + sector rotation +
 trailing stops + take-profit + Fear & Greed + MACD + Bollinger + ATR.
-Pass 'morning' or 'eod' as sys.argv[1] (default: morning).
+Pass 'morning', 'midday', or 'eod' as sys.argv[1] (default: morning).
+'morning' and 'midday' both run full buy logic; 'midday' only differs in labels.
 """
 
 import os, json, sys, time, math
@@ -1486,8 +1487,11 @@ def main():
     mode  = sys.argv[1] if len(sys.argv) > 1 else 'morning'
     print(f"[{today}] mode={mode}")
 
-    label = "Morning Analysis" if mode == 'morning' else "EOD Recap"
-    slack_send(f"{SLACK_MENTION} :robot_face: *{label} started* — {today} | Analysis running, report incoming...")
+    start_label = {'morning': 'Morning Analysis', 'midday': 'Midday Analysis',
+                   'eod': 'EOD Recap'}.get(mode, 'Morning Analysis')
+    brief = {'morning': 'Morning Brief', 'midday': 'Midday Brief',
+             'eod': 'EOD Recap'}.get(mode, 'Morning Brief')
+    slack_send(f"{SLACK_MENTION} :robot_face: *{start_label} started* — {today} | Analysis running, report incoming...")
 
     if mode == 'morning':
         check_session_expiry()
@@ -1564,7 +1568,7 @@ def main():
         r.logout()
         return
 
-    # ── Morning mode ──────────────────────────────────────────────────────
+    # ── Morning / Midday mode (full buy logic) ─────────────────────────────
     vix_block  = vix > 40
     vix_reduce = vix > 30 and not vix_block
 
@@ -1698,7 +1702,7 @@ def main():
                     print(f"  Rotation failed: {e}")
 
     # ── Slack message ─────────────────────────────────────────────────────
-    lines = [f"{SLACK_MENTION} 📈 *Morning Brief — {today}*\n"]
+    lines = [f"{SLACK_MENTION} 📈 *{brief} — {today}*\n"]
 
     lines.append(f"*Market:* SPY {spy_chg:+.2f}% | QQQ {qqq_chg:+.2f}% | VIX {vix:.1f}")
     lines.append(f"*Fear & Greed:* {fg_label(fg_score)}")
@@ -1774,7 +1778,7 @@ def main():
                   held, trades_done, buying_power, equity, stops_hit, targets_hit)
 
     # Slack — minimal ping with link + any critical alerts
-    ping_lines = [f"{SLACK_MENTION} 📊 *Morning Brief ready — {today}* | <{SHEET_URL}|Open Dashboard>"]
+    ping_lines = [f"{SLACK_MENTION} 📊 *{brief} ready — {today}* | <{SHEET_URL}|Open Dashboard>"]
     if targets_hit:
         for t in targets_hit:
             ping_lines.append(f"  🎯 *TAKE PROFIT:* {t['symbol']} @ ${t['price']:.2f} | P&L: *{t['pnl']:+.1f}%*")
