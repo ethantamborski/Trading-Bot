@@ -40,6 +40,8 @@ TAKE_PROFIT_AT        = 0.20   # full auto-sell when up 20%
 
 MIN_CONVICTION        = 5      # hard floor for fresh committee buys
 MAX_POSITION_PCT      = 0.40   # cap any single position at 40% of equity
+LEADER_MIN_SCORE      = 50     # leader_score (0-100) needed to reach the committee
+COMMITTEE_DEPTH       = 12     # how many top leaders get full committee analysis
 ROTATE_INTO_CONVICTION = 8     # only rotate capital into 8/10+ ideas
 ROTATE_LAGGARD_MAX_PNL = 3.0   # only rotate OUT of positions flat/red (< +3%)
 SWEEP_SKIP_BELOW_PNL  = -5.0   # don't add to holdings worse than -5% (no averaging into a stop)
@@ -157,6 +159,13 @@ def calc_bollinger(closes, period=20, devs=2):
 
 # ── Market data ───────────────────────────────────────────────────────────
 
+def _ret(closes, n):
+    """Percent return over the last n trading days."""
+    if len(closes) > n and closes[-(n + 1)] > 0:
+        return round((closes[-1] - closes[-(n + 1)]) / closes[-(n + 1)] * 100, 2)
+    return 0.0
+
+
 def get_stock_data(symbol):
     try:
         ticker = yf.Ticker(symbol)
@@ -183,10 +192,14 @@ def get_stock_data(symbol):
             'symbol':        symbol,
             'price':         round(price, 2),
             'day_chg':       round((price - prev) / prev * 100, 2),
+            'ret_5d':        _ret(closes, 5),
+            'ret_20d':       _ret(closes, 20),
+            'ret_60d':       _ret(closes, 60),
             'ma20':          round(ma20, 2),
             'ma50':          round(ma50, 2),
             'above_ma20':    price > ma20,
             'above_ma50':    price > ma50,
+            'ma20_rising':   ma20 > (sum(closes[-25:-5]) / 20 if len(closes) >= 25 else ma20),
             'rsi':           round(calc_rsi(closes[-30:] if len(closes) >= 30 else closes), 1),
             'macd':          calc_macd(closes),
             'bollinger':     calc_bollinger(closes),
@@ -292,6 +305,55 @@ def vcp_score(d, spy_chg):
     ])
 
 
+# ── Leader score (0–100 composite) ────────────────────────────────────────
+# Built to surface genuine winners EVEN ON DOWN MARKET DAYS. The heart of it is
+# multi-timeframe relative strength: a stock rising (or holding firm) while SPY
+# falls is the single best signal of institutional accumulation.
+
+def leader_score(d, spy):
+    """0–100 composite. Higher = stronger leadership. Down days reward RS most."""
+    rs_1d  = d['day_chg']  - spy.get('day_chg', 0)
+    rs_5d  = d['ret_5d']   - spy.get('ret_5d', 0)
+    rs_20d = d['ret_20d']  - spy.get('ret_20d', 0)
+
+    score = 0.0
+
+    # ── Relative strength vs SPY (40 pts) — the down-day edge ──
+    score += min(14, max(0, rs_1d * 3.5))      # today's outperformance
+    score += min(13, max(0, rs_5d * 1.3))      # week
+    score += min(13, max(0, rs_20d * 0.65))    # month (most durable)
+
+    # ── Absolute uptrend intact (30 pts) ──
+    score += 8 if d['above_ma20'] else 0
+    score += 9 if d['above_ma50'] else 0
+    score += 5 if d.get('ma20_rising') else 0
+    score += 8 if d['ret_20d'] > 0 else 0      # stock itself up over the month
+
+    # ── Momentum quality (20 pts) ──
+    rsi = d['rsi']
+    score += 8 if 52 <= rsi <= 72 else (4 if 45 <= rsi <= 80 else 0)
+    macd = d.get('macd', {})
+    score += 6 if macd.get('above_zero') else 0
+    score += 6 if macd.get('bullish_cross') else 0
+
+    # ── Setup quality (10 pts) ──
+    score += 6 if d['pct_from_high'] > -12 else (3 if d['pct_from_high'] > -20 else 0)
+    score += 4 if d['vol_ratio'] > 1.2 else (2 if d['vol_ratio'] > 1.0 else 0)
+
+    return round(min(100, max(0, score)), 1)
+
+
+def is_leader(d, spy):
+    """Quality gate — a genuine leader, even mid-correction. Avoids falling knives."""
+    rs_20d = d['ret_20d'] - spy.get('ret_20d', 0)
+    return (
+        d['above_ma50']                         # in its own uptrend
+        and d['rsi'] < 82                        # not blown off / overextended
+        and (d['ret_20d'] > 0 or rs_20d > 3)     # rising over a month OR strongly beating SPY
+        and d.get('leader_score', 0) >= LEADER_MIN_SCORE
+    )
+
+
 # ── Fear & Greed composite ────────────────────────────────────────────────
 
 def calc_fear_greed(vix, spy_chg, qqq_chg, sector_perf):
@@ -375,12 +437,18 @@ Leading sectors today: {sector_str}
 ══════════════════════════════════════
 CANDIDATE: {symbol}
 ══════════════════════════════════════
-Price: ${data['price']} | Day change: {data['day_chg']:+.2f}% | RS vs SPY: {rs:+.2f}%
+Price: ${data['price']} | Day change: {data['day_chg']:+.2f}% | RS vs SPY (today): {rs:+.2f}%
 Pre-market: {pre_str}
+
+RELATIVE STRENGTH (the key signal — especially on down days):
+  Stock returns: 5d {data.get('ret_5d', 0):+.1f}% | 20d {data.get('ret_20d', 0):+.1f}% | 60d {data.get('ret_60d', 0):+.1f}%
+  RS vs SPY: 1d {data.get('rs_1d', rs):+.1f}% | 5d {data.get('rs_5d', 0):+.1f}% | 20d {data.get('rs_20d', 0):+.1f}%
+  Leader score: {data.get('leader_score', 0)}/100  (composite of RS + trend + momentum)
+  → If this stock is rising while SPY falls, that is institutional accumulation. Weigh it heavily.
 
 TECHNICALS:
   RSI(14): {data['rsi']} | MA20: ${data['ma20']} | MA50: ${data['ma50']}
-  Above MA20: {data['above_ma20']} | Above MA50: {data['above_ma50']}
+  Above MA20: {data['above_ma20']} | Above MA50: {data['above_ma50']} | MA20 rising: {data.get('ma20_rising')}
   MACD: {macd['macd']} / Signal: {macd['signal_line']} | Above zero: {macd['above_zero']} | Fresh bullish cross: {macd['bullish_cross']}
   Bollinger %B: {boll['pct_b']} (0=lower band, 1=upper) | Squeeze forming: {boll['squeeze']}
   Volume: {data['vol_ratio']}x avg | ATR: ${data['atr']} ({data['atr_pct']}% of price) | ATR-based stop: ${atr_stop}
@@ -1686,20 +1754,47 @@ def main():
             stock_data[sym] = d
         time.sleep(0.2)
 
-    market_up = spy_chg > 0
-    qualified = sorted(
-        [(sym, d) for sym, d in stock_data.items()
-         if d['day_chg'] > spy_chg and vcp_score(d, spy_chg) >= 2],
-        key=lambda x: x[1]['day_chg'] - spy_chg,
+    # SPY multi-timeframe baseline for relative-strength scoring
+    spy_ref = spy_data or {'day_chg': spy_chg, 'ret_5d': 0, 'ret_20d': 0, 'ret_60d': 0}
+
+    # Score every candidate for leadership (works on down days via relative strength)
+    for sym, d in stock_data.items():
+        d['leader_score'] = leader_score(d, spy_ref)
+        d['rs_1d']  = round(d['day_chg'] - spy_ref.get('day_chg', 0), 2)
+        d['rs_5d']  = round(d['ret_5d']  - spy_ref.get('ret_5d', 0), 2)
+        d['rs_20d'] = round(d['ret_20d'] - spy_ref.get('ret_20d', 0), 2)
+
+    leaders = sorted(
+        [(sym, d) for sym, d in stock_data.items() if is_leader(d, spy_ref)],
+        key=lambda x: x[1]['leader_score'],
         reverse=True,
     )
-    print(f"{len(qualified)} passed screen (SPY {spy_chg:+.2f}%). Running full committee on top {min(10, len(qualified))}...")
+
+    # Fallback: if the leadership gate is empty (rare, brutal tape), take the
+    # strongest relative-strength names so we still surface the day's best.
+    if not leaders:
+        leaders = sorted(
+            [(sym, d) for sym, d in stock_data.items()
+             if d['above_ma50'] and d['rs_20d'] > 0],
+            key=lambda x: x[1]['leader_score'],
+            reverse=True,
+        )[:6]
+        if leaders:
+            print("No strict leaders — using top relative-strength names as fallback.")
+
+    qualified = leaders
+    if qualified:
+        top_preview = ', '.join(f"{s}({d['leader_score']:.0f})" for s, d in qualified[:5])
+        print(f"{len(qualified)} leaders found (SPY {spy_chg:+.2f}%). Top: {top_preview}")
+    else:
+        print(f"No leaders found today (SPY {spy_chg:+.2f}%).")
+    print(f"Running full committee on top {min(COMMITTEE_DEPTH, len(qualified))}...")
 
     trades_done = []
     skipped     = []
 
     if not vix_block and deployable >= 5:
-        for sym, data in qualified[:10]:
+        for sym, data in qualified[:COMMITTEE_DEPTH]:
             print(f"  Deep data + committee: {sym}...")
             deep      = get_deep_data(sym, data['price'])
             committee = run_committee(sym, data, deep, spy_chg, qqq_chg, vix,
