@@ -34,9 +34,11 @@ STOP_PCT       = 0.12
 
 CASH_RESERVE          = 0.0    # deploy everything — no idle cash
 CASH_BUFFER           = 1.00   # tiny $ buffer to avoid order rejections
-TRAIL_BREAKEVEN_AT    = 0.08   # trail stop to +0.5% when up 8%
-TRAIL_PROFIT_AT       = 0.15   # trail stop to +5% when up 15%
-TAKE_PROFIT_AT        = 0.20   # full auto-sell when up 20%
+# Exit management: ratcheting trailing-stop ladder (see load_positions).
+# NO hard profit cap — winners run free; the floor ratchets up as gains grow:
+#   +8%→breakeven, +15%→lock+5%, +20%→lock+10%, +25%→lock+15%,
+#   +35%→lock+25%, +50%→lock+38%. Base safety floor is the -12% hard stop.
+# The committee exit review can also sell a topped-out position at any level.
 
 MIN_CONVICTION        = 5      # hard floor for fresh committee buys
 MAX_POSITION_PCT      = 0.40   # cap any single position at 40% of equity
@@ -563,7 +565,8 @@ MARKET: {regime} | SPY {spy_chg:+.2f}% | QQQ {qqq_chg:+.2f}% | VIX {vix:.1f} | {
 
 POSITION: {symbol}
   Entry ${h['cost']:.2f} → Current ${data['price']:.2f} | Unrealized P&L: {h['pnl']:+.2f}%
-  Full take-profit target is +20%; hard stop is -12%.
+  There is NO fixed profit cap — if this still has room, HOLD and let it run well past +20%.
+  A ratcheting trailing stop already protects the gains; the only hard floor is -12%.
 
 FORWARD-LOOKING SIGNALS:
   Returns: 5d {data.get('ret_5d',0):+.1f}% | 20d {data.get('ret_20d',0):+.1f}%
@@ -575,11 +578,14 @@ RECENT NEWS:
 {news_str}
 
 ══════════════════════════════════════
-Debate it: Is momentum still intact with real room toward +20%, or is the move largely over
-(stalling RS, broken trend, overbought-and-rolling, exhausted catalyst)? Capturing a smaller
-gain now and redeploying into a fresh leader is GOOD if the remaining upside is poor — do not
-hold a dead-money position just to wait for +20%. But do NOT sell a strong runner with momentum
-still building. Estimate realistic remaining upside (%) to a sensible exit from today's price.
+Debate it: Is momentum still intact with real room to run, or is the move largely over
+(stalling RS, broken trend, overbought-and-rolling, exhausted catalyst)? Two-sided decision:
+ • SELL if upside is poor — capturing a smaller gain (even +5–8%) and redeploying into a fresh
+   leader beats holding dead money. Don't wait around for an arbitrary number.
+ • HOLD — and explicitly let it run BEYOND +20% — if momentum is still building and the trend is
+   intact. A position up +20% or +30% with strong RS and rising volume often has much further to
+   go; do not sell a strong runner just because it crossed a round number.
+Estimate realistic remaining upside (%) from today's price (can be large for a true runner).
 
 RESPOND IN THIS EXACT JSON — no markdown, no extra text:
 {{
@@ -629,43 +635,31 @@ def load_positions(buying_power):
             price = price if price > 0 else cost
             pnl   = (price - cost) / cost * 100
 
-            if pnl >= TAKE_PROFIT_AT * 100:
-                print(f"  TAKE PROFIT: {sym} +{pnl:.1f}%")
+            # ── Ratcheting profit floor — NO hard +20% cap; winners run free ──
+            # As the gain grows, the trailing stop ratchets up to lock in more
+            # profit. The position can climb indefinitely; it only exits if it
+            # pulls back to the current floor. The committee's exit review (run
+            # separately) can also sell a topped-out winner at any level.
+            if   pnl >= 50: stop, tier = round(cost * 1.38, 2), 'lock +38% (runner)'
+            elif pnl >= 35: stop, tier = round(cost * 1.25, 2), 'lock +25%'
+            elif pnl >= 25: stop, tier = round(cost * 1.15, 2), 'lock +15%'
+            elif pnl >= 20: stop, tier = round(cost * 1.10, 2), 'lock +10%'
+            elif pnl >= 15: stop, tier = round(cost * 1.05, 2), 'lock +5%'
+            elif pnl >= 8:  stop, tier = round(cost * 1.005, 2), 'breakeven'
+            else:           stop, tier = round(cost * (1 - STOP_PCT), 2), 'hard -12%'
+
+            if price <= stop:
+                label = f'trailing stop ({tier})' if pnl > 0 else 'hard stop -12%'
+                print(f"  EXIT {sym} @ ${price:.2f} ({pnl:+.1f}%) — {label}")
                 r.orders.order_sell_market(sym, qty, account_number=ACCOUNT_NUMBER, jsonify=True)
-                targets_hit.append({'symbol': sym, 'price': price, 'pnl': pnl, 'cost': cost, 'qty': qty})
+                bucket = targets_hit if pnl >= 15 else stops_hit
+                bucket.append({'symbol': sym, 'price': price, 'pnl': pnl,
+                               'type': label, 'cost': cost, 'qty': qty})
                 buying_power += qty * price
                 continue
 
-            if pnl >= TRAIL_PROFIT_AT * 100:
-                effective_stop = round(cost * 1.05, 2)
-                trailing_log.append(f"{sym} stop → +5% floor (${effective_stop})")
-                if price <= effective_stop:
-                    print(f"  TRAIL STOP (+5%): {sym}")
-                    r.orders.order_sell_market(sym, qty, account_number=ACCOUNT_NUMBER, jsonify=True)
-                    stops_hit.append({'symbol': sym, 'price': price, 'pnl': pnl, 'type': 'trail +5%', 'cost': cost, 'qty': qty})
-                    buying_power += qty * price
-                    continue
-                stop = effective_stop
-
-            elif pnl >= TRAIL_BREAKEVEN_AT * 100:
-                effective_stop = round(cost * 1.005, 2)
-                trailing_log.append(f"{sym} stop → breakeven (${effective_stop})")
-                if price <= effective_stop:
-                    print(f"  TRAIL STOP (breakeven): {sym}")
-                    r.orders.order_sell_market(sym, qty, account_number=ACCOUNT_NUMBER, jsonify=True)
-                    stops_hit.append({'symbol': sym, 'price': price, 'pnl': pnl, 'type': 'trail breakeven', 'cost': cost, 'qty': qty})
-                    buying_power += qty * price
-                    continue
-                stop = effective_stop
-
-            else:
-                stop = round(cost * (1 - STOP_PCT), 2)
-                if price <= stop:
-                    print(f"  HARD STOP: {sym} @ ${price:.2f}")
-                    r.orders.order_sell_market(sym, qty, account_number=ACCOUNT_NUMBER, jsonify=True)
-                    stops_hit.append({'symbol': sym, 'price': price, 'pnl': pnl, 'type': 'hard stop -12%', 'cost': cost, 'qty': qty})
-                    buying_power += qty * price
-                    continue
+            if pnl >= 8:
+                trailing_log.append(f"{sym} stop → {tier} (${stop})")
 
             held[sym] = {'qty': qty, 'cost': cost, 'price': price if price > 0 else cost, 'pnl': pnl, 'stop': stop}
         except Exception as e:
@@ -1024,7 +1018,7 @@ def update_closed_trades(sh, today, stops_hit, targets_hit):
         ws = ensure_tab(sh, 'Closed Trades', hdrs)
         for t in targets_hit:
             pnl_d = (t['price'] - t['cost']) * t['qty']
-            ws.append_row([today, t['symbol'], 'target +20%',
+            ws.append_row([today, t['symbol'], t.get('type', 'profit target'),
                            round(t['cost'], 2), round(t['price'], 2), round(t['qty'], 4),
                            round(t['pnl'], 2), round(pnl_d, 2)],
                           value_input_option='USER_ENTERED')
