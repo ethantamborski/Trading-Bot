@@ -32,14 +32,17 @@ ACCOUNT_NUMBER = '456166776'
 SLACK_MENTION  = '<@U0B8ZNEB9N2>'
 STOP_PCT       = 0.12
 
-CASH_RESERVE          = 0.10
+CASH_RESERVE          = 0.0    # deploy everything — no idle cash
+CASH_BUFFER           = 1.00   # tiny $ buffer to avoid order rejections
 TRAIL_BREAKEVEN_AT    = 0.08   # trail stop to +0.5% when up 8%
 TRAIL_PROFIT_AT       = 0.15   # trail stop to +5% when up 15%
 TAKE_PROFIT_AT        = 0.20   # full auto-sell when up 20%
 
-MIN_CONVICTION        = 6      # hard floor — never buy below this
+MIN_CONVICTION        = 5      # hard floor for fresh committee buys
+MAX_POSITION_PCT      = 0.40   # cap any single position at 40% of equity
 ROTATE_INTO_CONVICTION = 8     # only rotate capital into 8/10+ ideas
 ROTATE_LAGGARD_MAX_PNL = 3.0   # only rotate OUT of positions flat/red (< +3%)
+SWEEP_SKIP_BELOW_PNL  = -5.0   # don't add to holdings worse than -5% (no averaging into a stop)
 
 # 55-stock high-momentum universe
 CANDIDATES = list(dict.fromkeys([
@@ -701,6 +704,72 @@ def _bar_chart(sid, anchor_row, anchor_col, title, x_col, y_col, w=600, h=300):
     }}}
 
 
+def _column_chart(sid, anchor_row, anchor_col, title, x_col, y_cols, y_labels,
+                  y_axis_title='($)', w=680, h=340):
+    """Vertical column chart — multiple series render side by side per category."""
+    series = [
+        {'series': {'sourceRange': {'sources': [_rng(sid, 0, 2000, c, c+1)]}},
+         'targetAxis': 'LEFT_AXIS'}
+        for c in y_cols
+    ]
+    return {'addChart': {'chart': {
+        'spec': {
+            'title': title,
+            'titleTextFormat': {'bold': True, 'fontSize': 11, 'fontFamily': 'Arial'},
+            'basicChart': {
+                'chartType': 'COLUMN',
+                'legendPosition': 'BOTTOM_LEGEND',
+                'axis': [
+                    {'position': 'BOTTOM_AXIS', 'title': 'Date'},
+                    {'position': 'LEFT_AXIS',   'title': y_axis_title},
+                ],
+                'domains': [{'domain': {'sourceRange': {'sources': [_rng(sid, 0, 2000, x_col, x_col+1)]}}}],
+                'series': series,
+                'headerCount': 1,
+            },
+            'fontName': 'Arial',
+            'backgroundColor': _rgb('#FFFFFF'),
+        },
+        'position': {'overlayPosition': {
+            'anchorCell': {'sheetId': sid, 'rowIndex': anchor_row, 'columnIndex': anchor_col},
+            'widthPixels': w, 'heightPixels': h
+        }}
+    }}}
+
+
+def update_gains(sh, today, held):
+    """Money In vs Money Made — cost basis, current value, and total P&L over time."""
+    try:
+        invested   = sum(h['cost']  * h['qty'] for h in held.values())
+        mkt_value  = sum(h['price'] * h['qty'] for h in held.values())
+        unrealized = mkt_value - invested
+
+        # Cumulative realized P&L from the Closed Trades tab
+        realized = 0.0
+        try:
+            ct_vals = sh.worksheet('Closed Trades').get_all_values()
+            for row in ct_vals[1:]:
+                if len(row) >= 8:
+                    try:
+                        realized += float(row[7])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        total_pl = unrealized + realized
+
+        hdrs = ['Date', 'Invested ($)', 'Current Value ($)',
+                'Unrealized P&L ($)', 'Realized P&L ($)', 'Total P&L ($)']
+        ws = ensure_tab(sh, 'Gains & Losses', hdrs)
+        ws.append_row([today, round(invested, 2), round(mkt_value, 2),
+                       round(unrealized, 2), round(realized, 2), round(total_pl, 2)],
+                      value_input_option='RAW')
+        print(f"Gains & Losses appended (invested ${invested:.2f}, total P&L ${total_pl:+.2f}).")
+    except Exception as e:
+        print(f"Gains & Losses error: {e}")
+
+
 def get_prev_equity(sh, today):
     """Return the most recent equity value from a PREVIOUS day (not today)."""
     try:
@@ -929,6 +998,7 @@ def apply_formatting(sh, n_pos):
     shid  = ids.get('Sector History')
     ctid  = ids.get('Closed Trades')
     anid  = ids.get('Analytics')
+    gnid  = ids.get('Gains & Losses')
     C     = _C
     rq    = []
 
@@ -1077,6 +1147,23 @@ def apply_formatting(sh, n_pos):
             _colw(pid, 0, 100), _colw(pid, 1, 120),
             _colw(pid, 2, 110), _colw(pid, 3, 100), _colw(pid, 4, 100),
         ]
+
+    # ── Gains & Losses ────────────────────────────────────────────────────
+    if gnid is not None:
+        rq += [
+            _cell(gnid, 0, 1, 0, 6, bg=C['dkgrn'], fg=C['white'], bold=True, size=10, align='CENTER', valign='MIDDLE'),
+            _rowh(gnid, 0, 28),
+            _freeze(gnid, rows=1),
+            _cell(gnid, 1, 2000, 0, 6, fg=C['dgray'], size=9),
+            _cell(gnid, 1, 2000, 1, 6, align='RIGHT'),
+            _borders(gnid, 0, 2000, 0, 6, C['border']),
+            _cond(gnid, 1, 2000, 3, 6, 'NUMBER_GREATER', '0', C['lpos'], C['pos']),
+            _cond(gnid, 1, 2000, 3, 6, 'NUMBER_LESS', '0', C['lneg'], C['neg']),
+            _colw(gnid, 0, 100), _colw(gnid, 1, 110), _colw(gnid, 2, 130),
+            _colw(gnid, 3, 130), _colw(gnid, 4, 120), _colw(gnid, 5, 115),
+        ]
+        for i in range(1, 500):
+            rq.append(_cell(gnid, i, i+1, 0, 6, bg=(C['white'] if i % 2 == 1 else C['xmint'])))
 
     # ── Risk Monitor ──────────────────────────────────────────────────────
     if rmid is not None:
@@ -1230,6 +1317,22 @@ def apply_formatting(sh, n_pos):
         except Exception as e:
             print(f"Closed Trades chart error: {e}")
 
+    if gnid is not None:
+        _del_charts(sh, gnid)
+        try:
+            sh.batch_update({'requests': [
+                # Side-by-side: money put in vs what it's worth now (gap = your gains)
+                _column_chart(gnid, 1, 7,
+                    'Money Invested vs Current Value', 0, [1, 2],
+                    ['Invested ($)', 'Current Value ($)'], w=680, h=340),
+                # Total profit/loss over time
+                _line_chart(gnid, 19, 7,
+                    'Total Profit / Loss Over Time ($)', 0, 5, 'Total P&L ($)', w=680, h=300),
+            ]})
+            print("Gains & Losses charts added.")
+        except Exception as e:
+            print(f"Gains & Losses chart error: {e}")
+
 
 # ── Slack ─────────────────────────────────────────────────────────────────
 
@@ -1381,6 +1484,7 @@ def update_sheets(mode, today, spy_chg, qqq_chg, iwm_chg, vix, fg_score, sector_
     update_sector_history(sh, today, sector_perf)
     if stops_hit or targets_hit:
         update_closed_trades(sh, today, stops_hit, targets_hit)
+    update_gains(sh, today, held)
     update_analytics(sh, today)
 
     apply_formatting(sh, len(held))
@@ -1594,7 +1698,7 @@ def main():
     trades_done = []
     skipped     = []
 
-    if not vix_block and deployable >= 10:
+    if not vix_block and deployable >= 5:
         for sym, data in qualified[:10]:
             print(f"  Deep data + committee: {sym}...")
             deep      = get_deep_data(sym, data['price'])
@@ -1614,13 +1718,13 @@ def main():
                 skipped.append({'symbol': sym, 'conviction': conviction, 'reason': f'earnings in {dte} days', 'rs': rs})
                 continue
 
-            if conviction >= MIN_CONVICTION and action == 'BUY' and deployable >= 10:
-                base_pct = {6: 0.25, 7: 0.30, 8: 0.35, 9: 0.40, 10: 0.45}.get(min(conviction, 10), 0.25)
+            if conviction >= MIN_CONVICTION and action == 'BUY' and deployable >= 5:
+                base_pct = {5: 0.30, 6: 0.35, 7: 0.45, 8: 0.55, 9: 0.65, 10: 0.75}.get(min(conviction, 10), 0.30)
                 if vix_reduce:
                     base_pct *= 0.70
                 if dte is not None and dte <= 5:
                     base_pct *= 0.50
-                dollar_amt = round(min(buying_power * base_pct, deployable, equity * 0.30), 2)
+                dollar_amt = round(min(buying_power * base_pct, deployable, equity * MAX_POSITION_PCT), 2)
                 if dollar_amt < 1:
                     skipped.append({'symbol': sym, 'conviction': conviction, 'reason': f'insufficient funds', 'rs': rs, 'action': action, 'data': data, 'committee': committee})
                     continue
@@ -1701,6 +1805,33 @@ def main():
                 except Exception as e:
                     print(f"  Rotation failed: {e}")
 
+    # ── Full deployment sweep: never leave idle buying power ────────────────
+    swept = []
+    leftover = round(buying_power - CASH_BUFFER, 2)
+    if leftover >= 1:
+        # Prefer adding to existing holdings (heaviest into winners); never average
+        # into a position already worse than -5%. Fall back to top screen name, then QQQ.
+        eligible = [s for s, h in sorted(held.items(), key=lambda kv: kv[1]['pnl'], reverse=True)
+                    if h['pnl'] > SWEEP_SKIP_BELOW_PNL]
+        if not eligible:
+            eligible = [qualified[0][0]] if qualified else ['QQQ']
+        per = round(leftover / len(eligible), 2)
+        for sym in eligible:
+            if leftover < 1:
+                break
+            amt = round(min(per if per >= 1 else leftover, leftover), 2)
+            if amt < 1:
+                continue
+            try:
+                r.orders.order_buy_fractional_by_price(
+                    sym, amt, account_number=ACCOUNT_NUMBER, jsonify=True)
+                swept.append({'symbol': sym, 'amount': amt})
+                buying_power -= amt
+                leftover     -= amt
+                print(f"  💸 Swept ${amt:.2f} into {sym} (full deployment)")
+            except Exception as e:
+                print(f"  Sweep failed {sym}: {e}")
+
     # ── Slack message ─────────────────────────────────────────────────────
     lines = [f"{SLACK_MENTION} 📈 *{brief} — {today}*\n"]
 
@@ -1752,15 +1883,21 @@ def main():
         for ro in rotated_out:
             lines.append(f"↻ *Rotated:* sold {ro['symbol']} ({ro['pnl']:+.1f}%) → into {ro['into']} ({ro['conviction']}/10)\n")
 
+    if swept:
+        swept_str = ', '.join([f"{s['symbol']} ${s['amount']:.2f}" for s in swept])
+        lines.append(f"💸 *Full deployment* — swept idle cash into: {swept_str}\n")
+
     if trades_done:
         lines.append(f'*Committee bought {len(trades_done)} position(s) today:*\n')
         for t in trades_done:
             lines.append(build_trade_report(t))
             lines.append('')
+    elif swept:
+        lines.append('*No fresh committee buys — idle cash swept into existing holdings (see above).*')
     elif vix_block:
         lines.append('*No trades — VIX above 40 (extreme fear, sitting out).*')
-    elif deployable < 10:
-        lines.append('*No trades — buying power below minimum.*')
+    elif buying_power < 1:
+        lines.append('*No trades — fully invested, no cash to deploy.*')
     else:
         lines.append('*No trades — nothing cleared the full committee today.*')
         near = sorted([x for x in skipped if x['conviction'] >= 5],
