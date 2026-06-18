@@ -42,6 +42,9 @@ MIN_CONVICTION        = 5      # hard floor for fresh committee buys
 MAX_POSITION_PCT      = 0.40   # cap any single position at 40% of equity
 LEADER_MIN_SCORE      = 50     # leader_score (0-100) needed to reach the committee
 COMMITTEE_DEPTH       = 12     # how many top leaders get full committee analysis
+EXIT_REVIEW_ENABLED   = True   # actively review holdings to sell topped-out positions
+EXIT_UPSIDE_FLOOR     = 6      # SELL if committee sees < this % remaining upside
+EXIT_PROTECT_RUNNER   = 70     # never auto-sell a holding still scoring >= this (let winners run)
 ROTATE_INTO_CONVICTION = 8     # only rotate capital into 8/10+ ideas
 ROTATE_LAGGARD_MAX_PNL = 3.0   # only rotate OUT of positions flat/red (< +3%)
 SWEEP_SKIP_BELOW_PNL  = -5.0   # don't add to holdings worse than -5% (no averaging into a stop)
@@ -532,6 +535,75 @@ RESPOND IN THIS EXACT JSON — no markdown, no commentary outside the JSON:
         return result
     except Exception as e:
         print(f"  Committee error {symbol}: {e}")
+        return None
+
+
+# ── Active exit review — decide HOLD vs SELL on existing positions ─────────
+
+def review_holding(symbol, h, data, deep, spy_chg, qqq_chg, vix, fg_score, sector_perf):
+    """Ask the committee whether a held position has more room to run or has
+    topped out. Returns {'action': 'HOLD'|'SELL', 'remaining_upside': int,
+    'conviction': int, 'reason': str} — or None on error."""
+    macd = data.get('macd', {})
+    boll = data.get('bollinger', {})
+    news = deep.get('news') or []
+    news_str = '\n'.join(f'  - {n}' for n in news[:5]) if news else '  (none)'
+    pc   = deep.get('pc_ratio')
+    pc_str = f"{pc} ({'bearish hedging' if pc and pc > 1 else 'bullish'})" if pc else 'n/a'
+    regime = ('STRONG RISK-ON' if spy_chg > 1.0 and vix < 18 else
+              'RISK-ON'        if spy_chg > 0.3 and vix < 22 else
+              'RISK-OFF'       if spy_chg < -0.5 or vix > 28 else 'NEUTRAL/MIXED')
+
+    prompt = f"""You are the same six-member committee, now reviewing an OPEN position you already hold.
+The decision is binary: keep holding for more upside, or SELL NOW to free the capital for a better opportunity.
+Do not anchor to the original thesis. Judge only the forward outlook from today's price.
+
+══════════════════════════════════════
+MARKET: {regime} | SPY {spy_chg:+.2f}% | QQQ {qqq_chg:+.2f}% | VIX {vix:.1f} | {fg_label(fg_score)}
+
+POSITION: {symbol}
+  Entry ${h['cost']:.2f} → Current ${data['price']:.2f} | Unrealized P&L: {h['pnl']:+.2f}%
+  Full take-profit target is +20%; hard stop is -12%.
+
+FORWARD-LOOKING SIGNALS:
+  Returns: 5d {data.get('ret_5d',0):+.1f}% | 20d {data.get('ret_20d',0):+.1f}%
+  RS vs SPY: 5d {data.get('rs_5d',0):+.1f}% | 20d {data.get('rs_20d',0):+.1f}% | Leader score {data.get('leader_score',0)}/100
+  RSI(14): {data['rsi']} | Above MA20: {data['above_ma20']} | Above MA50: {data['above_ma50']} | MA20 rising: {data.get('ma20_rising')}
+  MACD above zero: {macd.get('above_zero')} | Fresh bullish cross: {macd.get('bullish_cross')} | Bollinger %B: {boll.get('pct_b')}
+  Distance from 52w high: {data['pct_from_high']}% | Volume: {data['vol_ratio']}x avg | Put/call: {pc_str}
+RECENT NEWS:
+{news_str}
+
+══════════════════════════════════════
+Debate it: Is momentum still intact with real room toward +20%, or is the move largely over
+(stalling RS, broken trend, overbought-and-rolling, exhausted catalyst)? Capturing a smaller
+gain now and redeploying into a fresh leader is GOOD if the remaining upside is poor — do not
+hold a dead-money position just to wait for +20%. But do NOT sell a strong runner with momentum
+still building. Estimate realistic remaining upside (%) to a sensible exit from today's price.
+
+RESPOND IN THIS EXACT JSON — no markdown, no extra text:
+{{
+  "remaining_upside": <integer percent of realistic upside left from today>,
+  "momentum": "BUILDING|INTACT|STALLING|BROKEN",
+  "action": "HOLD" or "SELL",
+  "conviction": <1-10 integer confidence in this call>,
+  "reason": "<1-2 sentences: the decisive factor>"
+}}"""
+
+    try:
+        resp = ai_client.messages.create(
+            model='claude-sonnet-4-6',
+            max_tokens=700,
+            messages=[{'role': 'user', 'content': prompt}]
+        )
+        text = resp.content[0].text.strip()
+        if text.startswith('```'):
+            text = text.split('\n', 1)[1].rsplit('```', 1)[0].strip()
+        import re as _re
+        text = _re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]', ' ', text)
+        return json.loads(text)
+    except Exception as e:
+        print(f"  Exit review error {symbol}: {e}")
         return None
 
 
@@ -1744,6 +1816,50 @@ def main():
     vix_block  = vix > 40
     vix_reduce = vix > 30 and not vix_block
 
+    # SPY multi-timeframe baseline for relative-strength scoring
+    spy_ref = spy_data or {'day_chg': spy_chg, 'ret_5d': 0, 'ret_20d': 0, 'ret_60d': 0}
+
+    # ── Active exit review: sell topped-out positions, free the capital ──────
+    managed_exits = []
+    if EXIT_REVIEW_ENABLED and held and not vix_block:
+        print(f"Exit review on {len(held)} holding(s)...")
+        for sym in list(held.keys()):
+            h = held[sym]
+            d = get_stock_data(sym)
+            if not d:
+                continue
+            d['leader_score'] = leader_score(d, spy_ref)
+            d['rs_5d']  = round(d['ret_5d']  - spy_ref.get('ret_5d', 0), 2)
+            d['rs_20d'] = round(d['ret_20d'] - spy_ref.get('ret_20d', 0), 2)
+            # Let strong runners run — trailing stops manage those, don't second-guess
+            if d['leader_score'] >= EXIT_PROTECT_RUNNER and d['rs_20d'] > 0:
+                print(f"  Exit review {sym}: HOLD (strong runner, score {d['leader_score']:.0f})")
+                continue
+            deep = get_deep_data(sym, d['price'])
+            rv = review_holding(sym, h, d, deep, spy_chg, qqq_chg, vix, fg_score, sector_perf)
+            if not rv:
+                continue
+            up  = rv.get('remaining_upside', 99)
+            act = rv.get('action', 'HOLD')
+            print(f"  Exit review {sym}: {act} | {rv.get('momentum','')} | upside {up}% | P&L {h['pnl']:+.1f}%")
+            if act == 'SELL' or up < EXIT_UPSIDE_FLOOR:
+                try:
+                    r.orders.order_sell_market(sym, h['qty'], account_number=ACCOUNT_NUMBER, jsonify=True)
+                    buying_power += h['qty'] * d['price']
+                    managed_exits.append({
+                        'symbol': sym, 'price': d['price'], 'cost': h['cost'],
+                        'qty': h['qty'], 'pnl': h['pnl'],
+                        'type': f"committee sell ({h['pnl']:+.1f}%)",
+                        'reason': rv.get('reason', ''), 'remaining_upside': up,
+                    })
+                    del held[sym]
+                    print(f"  🧠 Committee SOLD {sym} @ ${d['price']:.2f} ({h['pnl']:+.1f}%) — {rv.get('reason','')}")
+                except Exception as e:
+                    print(f"  Exit sell failed {sym}: {e}")
+        # Recompute available capital after freeing it
+        deployable = buying_power * (1 - CASH_RESERVE)
+        equity     = buying_power + sum(hh['price'] * hh['qty'] for hh in held.values())
+
     # Screen candidates
     to_screen = [s for s in CANDIDATES if s not in held]
     print(f"Screening {len(to_screen)} candidates...")
@@ -1753,9 +1869,6 @@ def main():
         if d:
             stock_data[sym] = d
         time.sleep(0.2)
-
-    # SPY multi-timeframe baseline for relative-strength scoring
-    spy_ref = spy_data or {'day_chg': spy_chg, 'ret_5d': 0, 'ret_20d': 0, 'ret_60d': 0}
 
     # Score every candidate for leadership (works on down days via relative strength)
     for sym, d in stock_data.items():
@@ -1953,6 +2066,13 @@ def main():
             lines.append(f"  ⚠️ {s['symbol']} @ ${s['price']:.2f} | P&L: {s['pnl']:+.1f}% ({s['type']})")
         lines.append('')
 
+    if managed_exits:
+        lines.append('*🧠 Committee-managed exits (upside exhausted, capital freed):*')
+        for m in managed_exits:
+            lines.append(f"  {m['symbol']} @ ${m['price']:.2f} | locked *{m['pnl']:+.1f}%* | "
+                         f"~{m['remaining_upside']}% upside left — {m['reason']}")
+        lines.append('')
+
     if trailing_log:
         lines.append('*Trailing stops updated:*')
         for t in trailing_log:
@@ -2005,9 +2125,11 @@ def main():
     lines.append(f"\n*Cash:* ${buying_power:.2f} | *Total equity:* ${equity:.2f}")
     lines.append('_Override: sell directly in Robinhood app_')
 
-    # Write everything to Google Sheets
+    # Write everything to Google Sheets (managed exits logged alongside stops
+    # so realized P&L flows into Closed Trades / Analytics / Gains & Losses)
     update_sheets(mode, today, spy_chg, qqq_chg, iwm_chg, vix, fg_score, sector_perf,
-                  held, trades_done, buying_power, equity, stops_hit, targets_hit)
+                  held, trades_done, buying_power, equity,
+                  stops_hit + managed_exits, targets_hit)
 
     # Slack — minimal ping with link + any critical alerts
     ping_lines = [f"{SLACK_MENTION} 📊 *{brief} ready — {today}* | <{SHEET_URL}|Open Dashboard>"]
