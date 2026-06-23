@@ -44,10 +44,12 @@ MIN_CONVICTION        = 5      # hard floor for fresh committee buys
 MAX_POSITION_PCT      = 0.40   # cap any single position at 40% of equity
 LEADER_MIN_SCORE      = 50     # leader_score (0-100) needed to reach the committee
 COMMITTEE_DEPTH       = 12     # how many top leaders get full committee analysis
-EXIT_REVIEW_ENABLED   = True   # actively review holdings to sell topped-out positions
-EXIT_UPSIDE_FLOOR     = 6      # SELL if committee sees < this % remaining upside
-EXIT_PROTECT_RUNNER   = 70     # never auto-sell a holding still scoring >= this (let winners run)
-EXIT_CUT_LOSS_AT      = -8.0   # if a position is down this much AND committee sees more downside, cut it now (STOP_PCT -12% remains the mechanical backstop)
+EXIT_REVIEW_ENABLED   = True   # committee reviews EVERY holding each run and decides HOLD/SELL at its discretion
+
+# Mechanical exits are SAFETY NETS only — the committee makes the buy/sell TIMING calls.
+# STOP_PCT (-12% from cost) = catastrophe stop. GIVEBACK = wide trailing backstop so a
+# big winner can't fully round-trip between the 3 daily committee reviews.
+GIVEBACK_FROM_PEAK    = 0.20   # exit only if a position falls 20% from its high-water mark
 ROTATE_INTO_CONVICTION = 8     # only rotate capital into 8/10+ ideas
 ROTATE_LAGGARD_MAX_PNL = 3.0   # only rotate OUT of positions flat/red (< +3%)
 SWEEP_SKIP_BELOW_PNL  = -5.0   # don't add to holdings worse than -5% (no averaging into a stop)
@@ -566,9 +568,11 @@ MARKET: {regime} | SPY {spy_chg:+.2f}% | QQQ {qqq_chg:+.2f}% | VIX {vix:.1f} | {
 
 POSITION: {symbol}
   Entry ${h['cost']:.2f} → Current ${data['price']:.2f} | Unrealized P&L: {h['pnl']:+.2f}%
-  There is NO fixed profit cap — if this still has room, HOLD and let it run well past +20%.
-  Downside: a -12% hard stop is the last-resort backstop, but DO NOT wait for it. If this is
-  losing and you see further downside, cut it NOW — a smaller controlled loss beats riding it down.
+  YOU decide the timing — there are no automatic profit targets or stop percentages driving this.
+  (Only two last-resort safety nets exist: a -12% catastrophe stop and a wide 20%-off-peak
+  backstop. Don't defer to them — make the call a portfolio manager would make right now.)
+  No fixed profit cap: let a true winner run. But if upside is exhausted, take the profit; and if
+  this is losing with more downside ahead, cut it now rather than hoping it comes back.
 
 FORWARD-LOOKING SIGNALS:
   Returns: 5d {data.get('ret_5d',0):+.1f}% | 20d {data.get('ret_20d',0):+.1f}%
@@ -621,11 +625,27 @@ RESPOND IN THIS EXACT JSON — no markdown, no extra text:
 
 # ── Position management with trailing stops + take-profit ─────────────────
 
+_PEAKS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'peaks.json')
+
+def _load_peaks():
+    try:
+        return json.load(open(_PEAKS_PATH))
+    except Exception:
+        return {}
+
+def _save_peaks(peaks):
+    try:
+        json.dump(peaks, open(_PEAKS_PATH, 'w'))
+    except Exception as e:
+        print(f"  Peak save error: {e}")
+
+
 def load_positions(buying_power):
     held         = {}
     stops_hit    = []
     targets_hit  = []
     trailing_log = []
+    peaks        = _load_peaks()
 
     raw = r.account.get_open_stock_positions(account_number=ACCOUNT_NUMBER) or []
     for pos in raw:
@@ -641,36 +661,36 @@ def load_positions(buying_power):
             price = price if price > 0 else cost
             pnl   = (price - cost) / cost * 100
 
-            # ── Ratcheting profit floor — NO hard +20% cap; winners run free ──
-            # As the gain grows, the trailing stop ratchets up to lock in more
-            # profit. The position can climb indefinitely; it only exits if it
-            # pulls back to the current floor. The committee's exit review (run
-            # separately) can also sell a topped-out winner at any level.
-            if   pnl >= 50: stop, tier = round(cost * 1.38, 2), 'lock +38% (runner)'
-            elif pnl >= 35: stop, tier = round(cost * 1.25, 2), 'lock +25%'
-            elif pnl >= 25: stop, tier = round(cost * 1.15, 2), 'lock +15%'
-            elif pnl >= 20: stop, tier = round(cost * 1.10, 2), 'lock +10%'
-            elif pnl >= 15: stop, tier = round(cost * 1.05, 2), 'lock +5%'
-            elif pnl >= 8:  stop, tier = round(cost * 1.005, 2), 'breakeven'
-            else:           stop, tier = round(cost * (1 - STOP_PCT), 2), 'hard -12%'
+            # ── SAFETY NETS ONLY — the committee makes the real timing calls ──
+            # 1) Catastrophe stop: -12% from cost (crash/gap protection)
+            # 2) Wide give-back trailing: exit only if price falls 20% from its
+            #    high-water mark, so a big winner can't fully round-trip between
+            #    the 3 daily committee reviews. Normal profit-taking and loss-
+            #    cutting timing is decided by the committee, not by these numbers.
+            peak        = max(peaks.get(sym, 0.0), price, cost)
+            peaks[sym]  = round(peak, 4)
+            catastrophe = round(cost * (1 - STOP_PCT), 2)
+            giveback    = round(peak * (1 - GIVEBACK_FROM_PEAK), 2)
+            stop        = max(catastrophe, giveback)
 
             if price <= stop:
-                label = f'trailing stop ({tier})' if pnl > 0 else 'hard stop -12%'
-                print(f"  EXIT {sym} @ ${price:.2f} ({pnl:+.1f}%) — {label}")
+                label = 'catastrophe -12%' if stop == catastrophe else f'-{int(GIVEBACK_FROM_PEAK*100)}% off peak'
+                print(f"  SAFETY EXIT {sym} @ ${price:.2f} ({pnl:+.1f}%) — {label}")
                 r.orders.order_sell_market(sym, qty, account_number=ACCOUNT_NUMBER, jsonify=True)
-                bucket = targets_hit if pnl >= 15 else stops_hit
+                bucket = targets_hit if pnl >= 0 else stops_hit
                 bucket.append({'symbol': sym, 'price': price, 'pnl': pnl,
-                               'type': label, 'cost': cost, 'qty': qty})
+                               'type': f'safety net ({label})', 'cost': cost, 'qty': qty})
                 buying_power += qty * price
+                peaks.pop(sym, None)
                 continue
 
-            if pnl >= 8:
-                trailing_log.append(f"{sym} stop → {tier} (${stop})")
-
-            held[sym] = {'qty': qty, 'cost': cost, 'price': price if price > 0 else cost, 'pnl': pnl, 'stop': stop}
+            held[sym] = {'qty': qty, 'cost': cost, 'price': price if price > 0 else cost,
+                         'pnl': pnl, 'stop': stop, 'peak': peak}
         except Exception as e:
             print(f"  Position error: {e}")
 
+    # Keep only peaks for positions we still hold
+    _save_peaks({s: held[s]['peak'] for s in held})
     return held, stops_hit, targets_hit, trailing_log, buying_power
 
 
@@ -1819,10 +1839,10 @@ def main():
     # SPY multi-timeframe baseline for relative-strength scoring
     spy_ref = spy_data or {'day_chg': spy_chg, 'ret_5d': 0, 'ret_20d': 0, 'ret_60d': 0}
 
-    # ── Active exit review: sell topped-out positions, free the capital ──────
+    # ── Committee exit review: judge EVERY holding, decide timing at discretion ─
     managed_exits = []
     if EXIT_REVIEW_ENABLED and held and not vix_block:
-        print(f"Exit review on {len(held)} holding(s)...")
+        print(f"Committee reviewing {len(held)} holding(s)...")
         for sym in list(held.keys()):
             h = held[sym]
             d = get_stock_data(sym)
@@ -1831,36 +1851,27 @@ def main():
             d['leader_score'] = leader_score(d, spy_ref)
             d['rs_5d']  = round(d['ret_5d']  - spy_ref.get('ret_5d', 0), 2)
             d['rs_20d'] = round(d['ret_20d'] - spy_ref.get('ret_20d', 0), 2)
-            # Let strong runners run — trailing stops manage those, don't second-guess
-            if d['leader_score'] >= EXIT_PROTECT_RUNNER and d['rs_20d'] > 0:
-                print(f"  Exit review {sym}: HOLD (strong runner, score {d['leader_score']:.0f})")
-                continue
             deep = get_deep_data(sym, d['price'])
             rv = review_holding(sym, h, d, deep, spy_chg, qqq_chg, vix, fg_score, sector_perf)
             if not rv:
                 continue
-            up   = rv.get('remaining_upside', 99)
+            up   = rv.get('remaining_upside', 0)
             act  = rv.get('action', 'HOLD')
             mom  = rv.get('momentum', '')
             dr   = rv.get('downside_risk', 'LOW')
-            print(f"  Exit review {sym}: {act} | {mom} | downside {dr} | upside {up}% | P&L {h['pnl']:+.1f}%")
+            print(f"  Review {sym}: {act} | {mom} | downside {dr} | est upside {up}% | P&L {h['pnl']:+.1f}%")
 
-            # Reasons to sell:
-            #  1. Committee says SELL
-            #  2. Upside exhausted (lock a gain / dead money)
-            #  3. Loss-cut: down past -8% AND committee sees more downside (don't ride to -12%)
-            cut_loss = (h['pnl'] <= EXIT_CUT_LOSS_AT and
-                        (dr == 'HIGH' or mom in ('BROKEN', 'STALLING') or up < 0))
-            if act == 'SELL' or up < EXIT_UPSIDE_FLOOR or cut_loss:
-                why = ('cut loss — more downside seen' if cut_loss and h['pnl'] < 0
-                       else rv.get('reason', ''))
+            # The committee's call IS the decision — no rigid % triggers.
+            if act == 'SELL':
+                why = rv.get('reason', '')
+                kind = 'loss-cut' if h['pnl'] < 0 else 'take-profit' if h['pnl'] > 0 else 'sell'
                 try:
                     r.orders.order_sell_market(sym, h['qty'], account_number=ACCOUNT_NUMBER, jsonify=True)
                     buying_power += h['qty'] * d['price']
                     managed_exits.append({
                         'symbol': sym, 'price': d['price'], 'cost': h['cost'],
                         'qty': h['qty'], 'pnl': h['pnl'],
-                        'type': f"committee {'loss-cut' if h['pnl'] < 0 else 'sell'} ({h['pnl']:+.1f}%)",
+                        'type': f"committee {kind} ({h['pnl']:+.1f}%)",
                         'reason': why, 'remaining_upside': up,
                     })
                     del held[sym]
