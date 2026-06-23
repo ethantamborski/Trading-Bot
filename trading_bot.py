@@ -47,6 +47,7 @@ COMMITTEE_DEPTH       = 12     # how many top leaders get full committee analysi
 EXIT_REVIEW_ENABLED   = True   # actively review holdings to sell topped-out positions
 EXIT_UPSIDE_FLOOR     = 6      # SELL if committee sees < this % remaining upside
 EXIT_PROTECT_RUNNER   = 70     # never auto-sell a holding still scoring >= this (let winners run)
+EXIT_CUT_LOSS_AT      = -8.0   # if a position is down this much AND committee sees more downside, cut it now (STOP_PCT -12% remains the mechanical backstop)
 ROTATE_INTO_CONVICTION = 8     # only rotate capital into 8/10+ ideas
 ROTATE_LAGGARD_MAX_PNL = 3.0   # only rotate OUT of positions flat/red (< +3%)
 SWEEP_SKIP_BELOW_PNL  = -5.0   # don't add to holdings worse than -5% (no averaging into a stop)
@@ -566,7 +567,8 @@ MARKET: {regime} | SPY {spy_chg:+.2f}% | QQQ {qqq_chg:+.2f}% | VIX {vix:.1f} | {
 POSITION: {symbol}
   Entry ${h['cost']:.2f} → Current ${data['price']:.2f} | Unrealized P&L: {h['pnl']:+.2f}%
   There is NO fixed profit cap — if this still has room, HOLD and let it run well past +20%.
-  A ratcheting trailing stop already protects the gains; the only hard floor is -12%.
+  Downside: a -12% hard stop is the last-resort backstop, but DO NOT wait for it. If this is
+  losing and you see further downside, cut it NOW — a smaller controlled loss beats riding it down.
 
 FORWARD-LOOKING SIGNALS:
   Returns: 5d {data.get('ret_5d',0):+.1f}% | 20d {data.get('ret_20d',0):+.1f}%
@@ -578,18 +580,22 @@ RECENT NEWS:
 {news_str}
 
 ══════════════════════════════════════
-Debate it: Is momentum still intact with real room to run, or is the move largely over
-(stalling RS, broken trend, overbought-and-rolling, exhausted catalyst)? Two-sided decision:
- • SELL if upside is poor — capturing a smaller gain (even +5–8%) and redeploying into a fresh
-   leader beats holding dead money. Don't wait around for an arbitrary number.
+Debate it: Is momentum still intact with real room to run, or is the move largely over /
+turning against us? Three-sided decision:
+ • SELL (lock a gain) if upside is poor — capturing a smaller gain (even +5–8%) and redeploying
+   into a fresh leader beats holding dead money. Don't wait for an arbitrary number.
+ • SELL (cut the loss) if this is RED and the trend/momentum is broken with more downside likely.
+   Do NOT ride a loser down to the -12% stop hoping it bounces — if you believe it goes lower,
+   cut it now (e.g. around -8%) and preserve capital. A controlled small loss is a WIN here.
  • HOLD — and explicitly let it run BEYOND +20% — if momentum is still building and the trend is
-   intact. A position up +20% or +30% with strong RS and rising volume often has much further to
-   go; do not sell a strong runner just because it crossed a round number.
-Estimate realistic remaining upside (%) from today's price (can be large for a true runner).
+   intact. A strong runner with rising RS and volume often has much further to go; do not sell it
+   just because it crossed a round number, and don't bail on a small dip if the thesis is intact.
+Estimate realistic remaining upside (%) from today's price (negative if you expect further losses).
 
 RESPOND IN THIS EXACT JSON — no markdown, no extra text:
 {{
-  "remaining_upside": <integer percent of realistic upside left from today>,
+  "remaining_upside": <integer percent of realistic upside left; can be NEGATIVE if you expect it to fall further>,
+  "downside_risk": "LOW|MEDIUM|HIGH",
   "momentum": "BUILDING|INTACT|STALLING|BROKEN",
   "action": "HOLD" or "SELL",
   "conviction": <1-10 integer confidence in this call>,
@@ -1833,21 +1839,32 @@ def main():
             rv = review_holding(sym, h, d, deep, spy_chg, qqq_chg, vix, fg_score, sector_perf)
             if not rv:
                 continue
-            up  = rv.get('remaining_upside', 99)
-            act = rv.get('action', 'HOLD')
-            print(f"  Exit review {sym}: {act} | {rv.get('momentum','')} | upside {up}% | P&L {h['pnl']:+.1f}%")
-            if act == 'SELL' or up < EXIT_UPSIDE_FLOOR:
+            up   = rv.get('remaining_upside', 99)
+            act  = rv.get('action', 'HOLD')
+            mom  = rv.get('momentum', '')
+            dr   = rv.get('downside_risk', 'LOW')
+            print(f"  Exit review {sym}: {act} | {mom} | downside {dr} | upside {up}% | P&L {h['pnl']:+.1f}%")
+
+            # Reasons to sell:
+            #  1. Committee says SELL
+            #  2. Upside exhausted (lock a gain / dead money)
+            #  3. Loss-cut: down past -8% AND committee sees more downside (don't ride to -12%)
+            cut_loss = (h['pnl'] <= EXIT_CUT_LOSS_AT and
+                        (dr == 'HIGH' or mom in ('BROKEN', 'STALLING') or up < 0))
+            if act == 'SELL' or up < EXIT_UPSIDE_FLOOR or cut_loss:
+                why = ('cut loss — more downside seen' if cut_loss and h['pnl'] < 0
+                       else rv.get('reason', ''))
                 try:
                     r.orders.order_sell_market(sym, h['qty'], account_number=ACCOUNT_NUMBER, jsonify=True)
                     buying_power += h['qty'] * d['price']
                     managed_exits.append({
                         'symbol': sym, 'price': d['price'], 'cost': h['cost'],
                         'qty': h['qty'], 'pnl': h['pnl'],
-                        'type': f"committee sell ({h['pnl']:+.1f}%)",
-                        'reason': rv.get('reason', ''), 'remaining_upside': up,
+                        'type': f"committee {'loss-cut' if h['pnl'] < 0 else 'sell'} ({h['pnl']:+.1f}%)",
+                        'reason': why, 'remaining_upside': up,
                     })
                     del held[sym]
-                    print(f"  🧠 Committee SOLD {sym} @ ${d['price']:.2f} ({h['pnl']:+.1f}%) — {rv.get('reason','')}")
+                    print(f"  🧠 Committee SOLD {sym} @ ${d['price']:.2f} ({h['pnl']:+.1f}%) — {why}")
                 except Exception as e:
                     print(f"  Exit sell failed {sym}: {e}")
         # Recompute available capital after freeing it
